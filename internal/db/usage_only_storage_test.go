@@ -124,6 +124,67 @@ func TestUsageOnlyStoragePolicyOwnsDirectAndBatchWrites(t *testing.T) {
 		"a second user turn conclusively demotes text-derived automation")
 }
 
+func TestUsageOnlyStoragePreservesContentFreeIncrementalSubagentEdge(
+	t *testing.T,
+) {
+	database := testDB(t)
+	database.EnableUsageOnlyStorage()
+
+	startedAt := "2026-08-31T10:00:00Z"
+	require.NoError(t, database.UpsertSession(Session{
+		ID: "parent", Project: "project", Agent: "claude", Machine: "local",
+		StartedAt: &startedAt,
+	}))
+	require.NoError(t, database.UpsertSession(Session{
+		ID: "child", Project: "project", Agent: "claude", Machine: "local",
+		StartedAt: &startedAt,
+	}))
+
+	require.NoError(t, database.WriteSessionIncremental(
+		"parent",
+		[]Message{{
+			SessionID: "parent", Ordinal: 0, Role: "assistant",
+			Model: "model-a", Content: "private delegated work",
+			HasToolUse: true,
+			ToolCalls: []ToolCall{{
+				ToolName: "Agent", Category: "Task", ToolUseID: "tool-use-1",
+				InputJSON: `{"prompt":"private subagent prompt"}`,
+			}},
+		}},
+		IncrementalSessionUpdate{
+			MsgCount: 1,
+			SubagentLinks: []ToolCallSubagentLink{{
+				ToolUseID: "tool-use-1", SubagentSessionID: "child",
+				ResultContent: "private subagent result", ResultContentLen: 23,
+				HasResult: true,
+			}},
+		},
+	))
+	require.NoError(t, database.LinkSubagentSessions())
+
+	child, err := database.GetSession(context.Background(), "child")
+	require.NoError(t, err)
+	require.NotNil(t, child)
+	require.NotNil(t, child.ParentSessionID)
+	assert.Equal(t, "parent", *child.ParentSessionID)
+	assert.Equal(t, "subagent", child.RelationshipType)
+
+	messages, err := database.GetAllMessages(context.Background(), "parent")
+	require.NoError(t, err)
+	require.Len(t, messages, 1)
+	require.Len(t, messages[0].ToolCalls, 1)
+	call := messages[0].ToolCalls[0]
+	assert.Equal(t, "tool-use-1", call.ToolUseID)
+	assert.Equal(t, "child", call.SubagentSessionID)
+	assert.Equal(t, "subagent", call.ToolName)
+	assert.Equal(t, "Task", call.Category)
+	assert.Empty(t, call.InputJSON)
+	assert.Empty(t, call.SkillName)
+	assert.Empty(t, call.ResultContent)
+	assert.Zero(t, call.ResultContentLength)
+	assert.Empty(t, call.ResultEvents)
+}
+
 func assertUsageOnlyStoredSession(
 	t *testing.T, database *DB, sessionID string, wantOrdinals []int,
 ) {

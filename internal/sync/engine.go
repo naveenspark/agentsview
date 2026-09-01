@@ -17651,24 +17651,23 @@ func (e *Engine) writeIncremental(
 	// since a long session legitimately exceeds it.
 	endedAt, _ = blankImplausibleTimestampPtr(endedAt)
 
-	var subagentLinks []db.ToolCallSubagentLink
-	if !e.usageOnly {
-		subagentLinks = make([]db.ToolCallSubagentLink, len(inc.links))
-		for i, link := range inc.links {
+	subagentLinks := make([]db.ToolCallSubagentLink, len(inc.links))
+	for i, link := range inc.links {
+		subagentLinks[i] = db.ToolCallSubagentLink{
+			ToolUseID: link.ToolUseID,
+			SubagentSessionID: applyIDPrefixToID(
+				e.idPrefix, link.SubagentSessionID,
+			),
+			HasResult: link.HasResult,
+		}
+		if !e.usageOnly {
 			toolCall := db.ToolCall{
 				ResultContent:       parser.DecodeContent(link.ResultContentRaw),
 				ResultContentLength: link.ResultContentLen,
 			}
 			e.anomalies.recordSanitize(db.SanitizeToolCall(&toolCall))
-			subagentLinks[i] = db.ToolCallSubagentLink{
-				ToolUseID: link.ToolUseID,
-				SubagentSessionID: applyIDPrefixToID(
-					e.idPrefix, link.SubagentSessionID,
-				),
-				ResultContent:    toolCall.ResultContent,
-				ResultContentLen: toolCall.ResultContentLength,
-				HasResult:        link.HasResult,
-			}
+			subagentLinks[i].ResultContent = toolCall.ResultContent
+			subagentLinks[i].ResultContentLen = toolCall.ResultContentLength
 		}
 	}
 

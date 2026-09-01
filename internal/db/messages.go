@@ -1049,7 +1049,7 @@ func (db *DB) WriteSessionIncremental(
 	rawMessages := msgs
 	msgs = db.messagesForStorage(msgs)
 	if db.UsageOnlyStorageEnabled() {
-		update.SubagentLinks = nil
+		update.SubagentLinks = usageOnlySubagentLinks(update.SubagentLinks)
 	}
 	t := time.Now()
 	defer func() {

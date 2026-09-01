@@ -1,5 +1,7 @@
 package db
 
+import "strings"
+
 // EnableUsageOnlyStorage makes usage accounting the database's storage
 // boundary. The switch is monotonic for the lifetime of a DB handle: once a
 // process promises not to persist transcript content, a later caller cannot
@@ -73,10 +75,10 @@ func usageOnlyMessages(messages []Message) []Message {
 		}
 		message.Content = ""
 		message.ThinkingText = ""
-		message.ToolCalls = nil
+		message.ToolCalls = usageOnlyToolCalls(message.ToolCalls)
 		message.ToolResults = nil
 		message.HasThinking = false
-		message.HasToolUse = false
+		message.HasToolUse = len(message.ToolCalls) > 0
 		message.ContentLength = 0
 		message.IsSystem = false
 		message.ContextTokens = 0
@@ -99,7 +101,57 @@ func usageOnlyMessageRequired(message Message) bool {
 		message.Model != "<synthetic>"
 	activityEligible := message.Role == "assistant" &&
 		message.Model != "<synthetic>"
-	return tokenEligible || activityEligible
+	return tokenEligible || activityEligible ||
+		usageOnlyMessageHasSubagentCall(message)
+}
+
+func usageOnlyMessageHasSubagentCall(message Message) bool {
+	for _, call := range message.ToolCalls {
+		if usageOnlySubagentCallRequired(call) {
+			return true
+		}
+	}
+	return false
+}
+
+func usageOnlySubagentCallRequired(call ToolCall) bool {
+	return call.SubagentSessionID != "" || call.Category == "Task" ||
+		strings.Contains(call.ToolName, "subagent")
+}
+
+// usageOnlyToolCalls retains the opaque identifiers needed to reconstruct
+// delegated-session relationships. Everything that can carry transcript or
+// tool-result content is replaced or discarded at the storage boundary.
+func usageOnlyToolCalls(calls []ToolCall) []ToolCall {
+	var stored []ToolCall
+	for _, call := range calls {
+		if !usageOnlySubagentCallRequired(call) {
+			continue
+		}
+		stored = append(stored, ToolCall{
+			ToolName:          "subagent",
+			Category:          "Task",
+			ToolUseID:         call.ToolUseID,
+			SubagentSessionID: call.SubagentSessionID,
+		})
+	}
+	return stored
+}
+
+func usageOnlySubagentLinks(
+	links []ToolCallSubagentLink,
+) []ToolCallSubagentLink {
+	var stored []ToolCallSubagentLink
+	for _, link := range links {
+		if link.ToolUseID == "" || link.SubagentSessionID == "" {
+			continue
+		}
+		stored = append(stored, ToolCallSubagentLink{
+			ToolUseID:         link.ToolUseID,
+			SubagentSessionID: link.SubagentSessionID,
+		})
+	}
+	return stored
 }
 
 func updateUsageOnlyAutomationTx(

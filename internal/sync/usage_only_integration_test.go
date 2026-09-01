@@ -2,6 +2,7 @@ package sync_test
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -12,7 +13,9 @@ import (
 
 	"go.kenn.io/agentsview/internal/db"
 	"go.kenn.io/agentsview/internal/dbtest"
+	"go.kenn.io/agentsview/internal/money"
 	"go.kenn.io/agentsview/internal/parser"
+	"go.kenn.io/agentsview/internal/service"
 	"go.kenn.io/agentsview/internal/sync"
 	"go.kenn.io/agentsview/internal/testjsonl"
 )
@@ -214,5 +217,109 @@ func TestUsageOnlyStoragePreservesUsageWithoutTranscriptContent(t *testing.T) {
 		assert.Empty(t, message.ThinkingText)
 		assert.Empty(t, message.ToolCalls)
 		assert.Empty(t, message.ToolResults)
+	}
+}
+
+func TestUsageOnlyStoragePreservesNestedToolLinkedSubagentUsage(
+	t *testing.T,
+) {
+	fullDB := dbtest.OpenTestDB(t)
+	usageDB := dbtest.OpenTestDB(t)
+	usageDB.EnableUsageOnlyStorage()
+
+	for _, database := range []*db.DB{fullDB, usageDB} {
+		seedUsageOnlySubagentUsage(t, database)
+		require.NoError(t, database.LinkSubagentSessions())
+	}
+
+	fullUsage, err := service.SessionUsageWithSubagents(
+		t.Context(), fullDB, "root", true,
+	)
+	require.NoError(t, err)
+	require.NotNil(t, fullUsage)
+	usageOnly, err := service.SessionUsageWithSubagents(
+		t.Context(), usageDB, "root", true,
+	)
+	require.NoError(t, err)
+	require.NotNil(t, usageOnly)
+
+	require.Equal(t, 2, fullUsage.SubagentCount)
+	assert.Equal(t, fullUsage, usageOnly,
+		"content compaction must preserve nested delegated token and cost totals")
+
+	for _, tc := range []struct {
+		sessionID string
+		childID   string
+	}{
+		{sessionID: "root", childID: "child"},
+		{sessionID: "child", childID: "grandchild"},
+	} {
+		messages, err := usageDB.GetAllMessages(t.Context(), tc.sessionID)
+		require.NoError(t, err)
+		require.Len(t, messages, 1)
+		require.Len(t, messages[0].ToolCalls, 1)
+		call := messages[0].ToolCalls[0]
+		assert.Equal(t, tc.childID, call.SubagentSessionID)
+		assert.Equal(t, "subagent", call.ToolName)
+		assert.Equal(t, "Task", call.Category)
+		assert.Empty(t, call.InputJSON)
+		assert.Empty(t, call.ResultContent)
+		assert.Empty(t, call.ResultEvents)
+	}
+}
+
+func seedUsageOnlySubagentUsage(t *testing.T, database *db.DB) {
+	t.Helper()
+	require.NoError(t, database.UpsertModelPricing([]db.ModelPricing{{
+		ModelPattern:  "test-model",
+		InputPerMTok:  money.MustParseDollars("2"),
+		OutputPerMTok: money.MustParseDollars("10"),
+	}}), "usage-only nested fixture")
+
+	startedAt := "2026-08-31T10:00:00Z"
+	for index, fixture := range []struct {
+		id     string
+		input  int
+		output int
+		child  string
+	}{
+		{id: "root", input: 1_000, output: 100, child: "child"},
+		{id: "child", input: 2_000, output: 200, child: "grandchild"},
+		{id: "grandchild", input: 3_000, output: 300},
+	} {
+		require.NoError(t, database.UpsertSession(db.Session{
+			ID: fixture.id, Project: "project", Agent: "claude", Machine: "local",
+			StartedAt: &startedAt, EndedAt: &startedAt, MessageCount: 1,
+			TotalOutputTokens: fixture.output, HasTotalOutputTokens: true,
+			PeakContextTokens: fixture.input, HasPeakContextTokens: true,
+		}))
+
+		message := db.Message{
+			SessionID: fixture.id, Ordinal: 0, Role: "assistant",
+			Timestamp: fmt.Sprintf("2026-08-31T10:00:0%dZ", index),
+			Model:     "test-model", Content: "private delegated response",
+			ClaudeMessageID: "message-" + fixture.id,
+			ClaudeRequestID: "request-" + fixture.id,
+			TokenUsage: []byte(fmt.Sprintf(
+				`{"input_tokens":%d,"output_tokens":%d}`,
+				fixture.input, fixture.output,
+			)),
+		}
+		if fixture.child != "" {
+			message.HasToolUse = true
+			message.ToolCalls = []db.ToolCall{{
+				ToolName: "Agent", Category: "Task",
+				ToolUseID:           "tool-use-" + fixture.id,
+				InputJSON:           `{"prompt":"private delegated prompt"}`,
+				ResultContent:       "private delegated result",
+				ResultContentLength: 24,
+				SubagentSessionID:   fixture.child,
+				ResultEvents: []db.ToolResultEvent{{
+					SubagentSessionID: fixture.child,
+					Content:           "private event content",
+				}},
+			}}
+		}
+		require.NoError(t, database.InsertMessages([]db.Message{message}))
 	}
 }
