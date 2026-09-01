@@ -1,6 +1,9 @@
 package db
 
-import "strings"
+import (
+	"slices"
+	"strings"
+)
 
 // EnableUsageOnlyStorage makes usage accounting the database's storage
 // boundary. The switch is monotonic for the lifetime of a DB handle: once a
@@ -106,12 +109,9 @@ func usageOnlyMessageRequired(message Message) bool {
 }
 
 func usageOnlyMessageHasSubagentCall(message Message) bool {
-	for _, call := range message.ToolCalls {
-		if usageOnlySubagentCallRequired(call) {
-			return true
-		}
-	}
-	return false
+	return slices.ContainsFunc(
+		message.ToolCalls, usageOnlySubagentCallRequired,
+	)
 }
 
 func usageOnlySubagentCallRequired(call ToolCall) bool {
