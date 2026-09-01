@@ -52,6 +52,7 @@ func (offlineRemoteTransport) RoundTrip(
 
 type syncRouteFixtureConfig struct {
 	stale          bool
+	usageOnly      bool
 	remoteHosts    []config.RemoteHost
 	disabledAgents []parser.AgentType
 	extraAgentDirs map[parser.AgentType][]string
@@ -74,6 +75,10 @@ func captureServerLogOutput(t *testing.T) *bytes.Buffer {
 
 func withStaleDB() syncRouteFixtureOption {
 	return func(c *syncRouteFixtureConfig) { c.stale = true }
+}
+
+func withUsageOnlyStorage() syncRouteFixtureOption {
+	return func(c *syncRouteFixtureConfig) { c.usageOnly = true }
 }
 
 func withLocalSyncRunner(r LocalSyncRunner) syncRouteFixtureOption {
@@ -137,6 +142,7 @@ func newSyncRouteFixture(
 		DataDir:      dir,
 		DBPath:       dbPath,
 		WriteTimeout: 30 * time.Second,
+		UsageOnly:    cfg.usageOnly,
 		AgentDirs: map[parser.AgentType][]string{
 			parser.AgentClaude: {claudeDir},
 		},
@@ -1497,6 +1503,29 @@ func TestSyncEngineForLocalReusesNoSyncEngineConcurrently(t *testing.T) {
 	require.NotNil(t, engines[0])
 	for _, engine := range engines[1:] {
 		assert.Same(t, engines[0], engine)
+	}
+}
+
+func TestSyncEngineForLocalCarriesUsageOnlyStoragePolicy(t *testing.T) {
+	f := newSyncRouteFixture(t, withUsageOnlyStorage())
+	f.writeClaudeSession(t, "proj/private.jsonl", "private prompt")
+
+	stats := f.srv.syncEngineForLocal(f.db).SyncAll(t.Context(), nil)
+	require.Equal(t, 1, stats.Synced)
+
+	page, err := f.db.ListSessions(t.Context(), db.SessionFilter{Limit: 10})
+	require.NoError(t, err)
+	require.Len(t, page.Sessions, 1)
+	assert.Nil(t, page.Sessions[0].FirstMessage)
+
+	messages, err := f.db.GetAllMessages(t.Context(), page.Sessions[0].ID)
+	require.NoError(t, err)
+	require.NotEmpty(t, messages)
+	for _, message := range messages {
+		assert.Empty(t, message.Content)
+		assert.Empty(t, message.ThinkingText)
+		assert.Empty(t, message.ToolCalls)
+		assert.Empty(t, message.ToolResults)
 	}
 }
 
