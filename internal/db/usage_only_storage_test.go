@@ -106,6 +106,22 @@ func TestUsageOnlyStoragePolicyOwnsDirectAndBatchWrites(t *testing.T) {
 	require.NotNil(t, incrementalStored)
 	assert.True(t, incrementalStored.IsAutomated,
 		"incremental classification must use text before it is discarded")
+
+	require.NoError(t, database.WriteSessionIncremental(
+		incrementalSession.ID,
+		[]Message{{
+			SessionID: incrementalSession.ID, Ordinal: 1,
+			Role: "user", Content: "a second interactive turn",
+		}},
+		IncrementalSessionUpdate{MsgCount: 2, UserMsgCount: 2},
+	))
+	incrementalStored, err = database.GetSessionFull(
+		context.Background(), incrementalSession.ID,
+	)
+	require.NoError(t, err)
+	require.NotNil(t, incrementalStored)
+	assert.False(t, incrementalStored.IsAutomated,
+		"a second user turn conclusively demotes text-derived automation")
 }
 
 func assertUsageOnlyStoredSession(

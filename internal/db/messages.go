@@ -984,7 +984,7 @@ func (db *DB) InsertMessages(msgs []Message) error {
 	for _, sessionID := range sessionIDs {
 		var err error
 		if db.UsageOnlyStorageEnabled() {
-			err = promoteUsageOnlyAutomationTx(
+			err = updateUsageOnlyAutomationTx(
 				tx, sessionID, messagesForSession(rawMessages, sessionID),
 			)
 		} else {
@@ -1092,7 +1092,7 @@ func (db *DB) WriteSessionIncremental(
 		return err
 	}
 	if db.UsageOnlyStorageEnabled() {
-		err = promoteUsageOnlyAutomationTx(tx, sessionID, rawMessages)
+		err = updateUsageOnlyAutomationTx(tx, sessionID, rawMessages)
 	} else {
 		err = updateSessionAutomationFromMessagesTx(tx, sessionID)
 	}
@@ -1269,7 +1269,7 @@ func (db *DB) ReplaceSessionMessages(
 		return err
 	}
 	if db.UsageOnlyStorageEnabled() {
-		err = promoteUsageOnlyAutomationTx(tx, sessionID, rawMessages)
+		err = updateUsageOnlyAutomationTx(tx, sessionID, rawMessages)
 	} else {
 		err = updateSessionAutomationFromMessagesTx(tx, sessionID)
 	}
@@ -1536,7 +1536,7 @@ func (db *DB) ReplaceSessionContent(
 		return err
 	}
 	if db.UsageOnlyStorageEnabled() {
-		err = promoteUsageOnlyAutomationTx(tx, sessionID, rawMessages)
+		err = updateUsageOnlyAutomationTx(tx, sessionID, rawMessages)
 	} else {
 		err = updateSessionAutomationFromMessagesTx(tx, sessionID)
 	}

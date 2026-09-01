@@ -46,6 +46,15 @@ func (db *DB) sessionAndMessagesForStorage(
 	return db.sessionForStorage(session), usageOnlyMessages(messages)
 }
 
+// ProjectSessionForStorage applies this database handle's storage policy to a
+// prepared session without writing it. Report-only callers use the same
+// projection as the write boundary before comparing prepared and stored rows.
+func (db *DB) ProjectSessionForStorage(
+	session Session, messages []Message,
+) (Session, []Message) {
+	return db.sessionAndMessagesForStorage(session, messages)
+}
+
 func (db *DB) messagesForStorage(messages []Message) []Message {
 	if !db.UsageOnlyStorageEnabled() {
 		return messages
@@ -93,18 +102,35 @@ func usageOnlyMessageRequired(message Message) bool {
 	return tokenEligible || activityEligible
 }
 
-func promoteUsageOnlyAutomationTx(
+func updateUsageOnlyAutomationTx(
 	tx transactionQueries, sessionID string, messages []Message,
 ) error {
 	var userMessageCount int
 	var automated bool
+	var agent, sessionKind string
 	err := tx.QueryRow(
-		`SELECT user_message_count, is_automated FROM sessions WHERE id = ?`,
+		`SELECT user_message_count, is_automated, agent, session_kind
+		   FROM sessions WHERE id = ?`,
 		sessionID,
-	).Scan(&userMessageCount, &automated)
+	).Scan(&userMessageCount, &automated, &agent, &sessionKind)
 	if err != nil {
 		return err
 	}
+	if IsAutomatedSessionMetadata(agent, sessionKind) {
+		if automated {
+			return nil
+		}
+		return setSessionAutomationTx(tx, sessionID, true)
+	}
+	if userMessageCount > 1 {
+		if !automated {
+			return nil
+		}
+		return setSessionAutomationTx(tx, sessionID, false)
+	}
+	// An incremental tail may omit the first user message whose text was
+	// discarded after the original classification. Preserve an existing
+	// one-turn verdict; new raw text can still promote an unclassified row.
 	if automated || !IsAutomatedTranscript(userMessageCount, messages, nil) {
 		return nil
 	}
