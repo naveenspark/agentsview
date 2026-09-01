@@ -220,6 +220,55 @@ func TestUsageOnlyStoragePreservesUsageWithoutTranscriptContent(t *testing.T) {
 	}
 }
 
+func TestUsageOnlyStorageClaudeUserAppendStaysIncremental(t *testing.T) {
+	claudeRoot := t.TempDir()
+	sessionID := "usage-only-incremental-claude"
+	path := filepath.Join(claudeRoot, "project", sessionID+".jsonl")
+	require.NoError(t, os.MkdirAll(filepath.Dir(path), 0o755))
+	initial := testjsonl.NewSessionBuilder().
+		AddClaudeUserWithSessionID(
+			"2026-08-31T10:00:00Z", "initial private prompt",
+			sessionID, "/workspace/project",
+		).
+		AddClaudeAssistantUsage(
+			"2026-08-31T10:00:01Z", "initial private response",
+			testjsonl.ClaudeAssistantUsage{
+				MessageID: "msg-initial", RequestID: "req-initial",
+				Model: "claude-sonnet-4-6", InputTokens: 100, OutputTokens: 10,
+			},
+		)
+	require.NoError(t, os.WriteFile(path, []byte(initial.String()), 0o600))
+
+	database := dbtest.OpenTestDB(t)
+	engine := sync.NewEngine(database, sync.EngineConfig{
+		AgentDirs: map[parser.AgentType][]string{
+			parser.AgentClaude: {claudeRoot},
+		},
+		Machine: "local", UsageOnly: true,
+	})
+	t.Cleanup(engine.Close)
+	require.Equal(t, 1, engine.SyncAll(t.Context(), nil).Synced)
+
+	appendFile, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0o600)
+	require.NoError(t, err)
+	_, err = appendFile.WriteString(
+		testjsonl.ClaudeUserJSON(
+			"second private prompt", "2026-08-31T10:00:02Z",
+		) + "\n",
+	)
+	require.NoError(t, err)
+	require.NoError(t, appendFile.Close())
+	engine.SyncPathsContext(t.Context(), []string{path})
+
+	stored, err := database.GetSessionFull(t.Context(), sessionID)
+	require.NoError(t, err)
+	require.NotNil(t, stored)
+	assert.True(t, stored.LastWriteIncremental,
+		"discarded previews cannot force a full parse on every user append")
+	assert.Equal(t, 2, stored.UserMessageCount)
+	assert.Nil(t, stored.FirstMessage)
+}
+
 func TestUsageOnlyStoragePreservesNestedToolLinkedSubagentUsage(
 	t *testing.T,
 ) {

@@ -28,6 +28,7 @@ import (
 	"go.kenn.io/agentsview/internal/secrets"
 	"go.kenn.io/agentsview/internal/signals"
 	"go.kenn.io/agentsview/internal/timeutil"
+	"go.kenn.io/agentsview/internal/usagefacts"
 )
 
 const (
@@ -14420,8 +14421,10 @@ func (e *Engine) tryIncrementalJSONL(
 	// Other agents can legitimately have an empty first_message
 	// alongside real user rows — for example Codex inserts orphan
 	// subagent notifications as Role=user messages that bypass
-	// firstMessage — so this fall-through is gated on Claude.
-	if agent == parser.AgentClaude && inc.FirstMessage == "" &&
+	// firstMessage — so this fall-through is gated on Claude. Usage-only
+	// archives deliberately discard every preview; their incremental
+	// automation classifier consumes the raw appended rows instead.
+	if !e.usageOnly && agent == parser.AgentClaude && inc.FirstMessage == "" &&
 		chunkHasRealUserPrompt(newMsgs) {
 		log.Printf(
 			"incremental %s %s: first real user prompt after "+
@@ -17988,9 +17991,23 @@ func (e *Engine) shouldPreserveOpenCodeFormatArchive(
 		)
 		return true
 	}
-	if openCodeLegacyArchiveLooksIncomplete(
-		currentMsgs, storedMsgs,
-	) {
+	incomplete := false
+	if e.usageOnly {
+		_, comparableCurrentMsgs := e.db.ProjectSessionForStorage(
+			db.Session{}, currentMsgs,
+		)
+		_, comparableStoredMsgs := e.db.ProjectSessionForStorage(
+			db.Session{}, storedMsgs,
+		)
+		incomplete = openCodeUsageOnlyArchiveLooksIncomplete(
+			comparableCurrentMsgs, comparableStoredMsgs,
+		)
+	} else {
+		incomplete = openCodeLegacyArchiveLooksIncomplete(
+			currentMsgs, storedMsgs,
+		)
+	}
+	if incomplete {
 		if hasOpenCodeFormatStorageFingerprint(agent, storedHash) {
 			log.Printf(
 				"skip %s session %s: storage fingerprint changed but update looks incomplete relative to archive",
@@ -18137,6 +18154,48 @@ func openCodeLegacyArchiveLooksIncomplete(
 	return false
 }
 
+func openCodeUsageOnlyArchiveLooksIncomplete(
+	parsed, stored []db.Message,
+) bool {
+	if parsed == nil {
+		return len(stored) > 0
+	}
+	if len(parsed) < len(stored) {
+		return true
+	}
+	parsedByIdentity := make(
+		map[openCodeMessageIdentity]db.Message, len(parsed),
+	)
+	for _, message := range parsed {
+		parsedByIdentity[openCodeMessageStorageIdentity(message)] = message
+	}
+	for _, storedMessage := range stored {
+		parsedMessage, ok := parsedByIdentity[openCodeMessageStorageIdentity(storedMessage)]
+		if !ok || openCodeUsageOnlyMessageLooksIncomplete(
+			parsedMessage, storedMessage,
+		) {
+			return true
+		}
+	}
+	return false
+}
+
+type openCodeMessageIdentity struct {
+	sourceUUID string
+	ordinal    int
+	role       string
+}
+
+func openCodeMessageStorageIdentity(message db.Message) openCodeMessageIdentity {
+	if message.SourceUUID != "" {
+		return openCodeMessageIdentity{sourceUUID: message.SourceUUID}
+	}
+	return openCodeMessageIdentity{
+		ordinal: message.Ordinal,
+		role:    message.Role,
+	}
+}
+
 func openCodeMessageLooksIncomplete(
 	parsed, stored db.Message,
 ) bool {
@@ -18167,6 +18226,37 @@ func openCodeMessageLooksIncomplete(
 	}
 	return countToolResultEvents(parsed.ToolCalls) <
 		countToolResultEvents(stored.ToolCalls)
+}
+
+func openCodeUsageOnlyMessageLooksIncomplete(
+	parsed, stored db.Message,
+) bool {
+	if parsed.Role != stored.Role {
+		return false
+	}
+	if openCodeUsageLooksIncomplete(parsed, stored) {
+		return true
+	}
+	return len(parsed.ToolCalls) < len(stored.ToolCalls)
+}
+
+func openCodeUsageLooksIncomplete(parsed, stored db.Message) bool {
+	if len(stored.TokenUsage) == 0 {
+		return false
+	}
+	if len(parsed.TokenUsage) == 0 ||
+		(stored.Model != "" && parsed.Model == "") {
+		return true
+	}
+	parsedUsage := usagefacts.ParseTokenUsage(string(parsed.TokenUsage))
+	storedUsage := usagefacts.ParseTokenUsage(string(stored.TokenUsage))
+	return parsedUsage.InputTokens < storedUsage.InputTokens ||
+		parsedUsage.OutputTokens < storedUsage.OutputTokens ||
+		parsedUsage.ReasoningTokens < storedUsage.ReasoningTokens ||
+		parsedUsage.CacheCreationTokens < storedUsage.CacheCreationTokens ||
+		parsedUsage.CacheCreation1hTokens < storedUsage.CacheCreation1hTokens ||
+		parsedUsage.CacheReadTokens < storedUsage.CacheReadTokens ||
+		parsedUsage.WebSearchRequests < storedUsage.WebSearchRequests
 }
 
 func sanitizedMessageContentLength(msg db.Message) int {
