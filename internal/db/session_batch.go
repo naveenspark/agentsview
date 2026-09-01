@@ -136,7 +136,7 @@ func (db *DB) WriteSessionBatchContext(
 			write.Session, write.Messages,
 		)
 		if db.UsageOnlyStorageEnabled() {
-			write.Signals = SessionSignalUpdate{}
+			write.Signals = usageOnlySignalUpdate()
 			write.Findings = nil
 			write.SkipSignalUpdates = false
 		}
@@ -233,7 +233,7 @@ func (db *DB) WriteSessionBatchAtomic(
 			write.Session, write.Messages,
 		)
 		if db.UsageOnlyStorageEnabled() {
-			write.Signals = SessionSignalUpdate{}
+			write.Signals = usageOnlySignalUpdate()
 			write.Findings = nil
 			write.SkipSignalUpdates = false
 		}

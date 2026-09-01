@@ -957,7 +957,7 @@ func NewEngine(
 			context.Background(), sessionID,
 		)
 	}
-	if cfg.DisableSignalRecomputation {
+	if e.disableSignalRecompute {
 		recompute = func(string) {}
 	}
 	e.signalSched = newSignalScheduler(
@@ -977,7 +977,7 @@ func NewEngine(
 			flush()
 		},
 	)
-	if cfg.DisableSignalRecomputation {
+	if e.disableSignalRecompute {
 		e.signalSched.stop()
 	}
 	return e
@@ -15231,6 +15231,9 @@ func (e *Engine) failProjectIdentityBackfill(
 func (e *Engine) recomputeSignalsFromDB(
 	ctx context.Context, sessionID string,
 ) (int, error) {
+	if e.usageOnly {
+		return 0, e.db.SettleUsageOnlySignals(sessionID)
+	}
 	if e.disableSignalRecompute {
 		return 0, nil
 	}

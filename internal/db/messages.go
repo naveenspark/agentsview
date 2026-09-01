@@ -993,7 +993,12 @@ func (db *DB) InsertMessages(msgs []Message) error {
 		if err != nil {
 			return err
 		}
-		if err := invalidateSessionSignalsTx(tx, sessionID); err != nil {
+		if db.UsageOnlyStorageEnabled() {
+			err = settleUsageOnlySignalsTx(tx, sessionID)
+		} else {
+			err = invalidateSessionSignalsTx(tx, sessionID)
+		}
+		if err != nil {
 			return err
 		}
 	}
@@ -1099,7 +1104,12 @@ func (db *DB) WriteSessionIncremental(
 	if err != nil {
 		return err
 	}
-	if err := invalidateSessionSignalsTx(tx, sessionID); err != nil {
+	if db.UsageOnlyStorageEnabled() {
+		err = settleUsageOnlySignalsTx(tx, sessionID)
+	} else {
+		err = invalidateSessionSignalsTx(tx, sessionID)
+	}
+	if err != nil {
 		return err
 	}
 	if err := tx.Commit(); err != nil {
@@ -1276,16 +1286,21 @@ func (db *DB) ReplaceSessionMessages(
 	if err != nil {
 		return err
 	}
-	// The new messages invalidate any findings scanned from the old content, so
-	// clear them and reset the scan state (empty version => secrets scan
-	// --backfill re-scans). ReplaceSessionContent does not call this method; it
-	// supplies fresh findings via replaceSecretFindingsTx directly.
-	if transcriptChanged {
-		if err := replaceSecretFindingsTx(tx, sessionID, nil, 0, ""); err != nil {
-			return err
+	if db.UsageOnlyStorageEnabled() {
+		err = settleUsageOnlySignalsTx(tx, sessionID)
+	} else {
+		// The new messages invalidate any findings scanned from the old content,
+		// so clear them and reset the scan state (empty version => secrets scan
+		// --backfill re-scans). ReplaceSessionContent does not call this method;
+		// it supplies fresh findings via replaceSecretFindingsTx directly.
+		if transcriptChanged {
+			if err := replaceSecretFindingsTx(tx, sessionID, nil, 0, ""); err != nil {
+				return err
+			}
 		}
+		err = invalidateSessionSignalsTx(tx, sessionID)
 	}
-	if err := invalidateSessionSignalsTx(tx, sessionID); err != nil {
+	if err != nil {
 		return err
 	}
 	if err := enqueueArtifactExportIfGenerationUnchangedTx(
@@ -1475,7 +1490,7 @@ func (db *DB) ReplaceSessionContent(
 	rawMessages := msgs
 	msgs = db.messagesForStorage(msgs)
 	if db.UsageOnlyStorageEnabled() {
-		signals = SessionSignalUpdate{}
+		signals = usageOnlySignalUpdate()
 		findings = nil
 	}
 	db.mu.Lock()

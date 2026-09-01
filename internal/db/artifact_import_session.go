@@ -77,7 +77,7 @@ func (db *DB) applyArtifactImportedSession(
 		write.Session, write.Messages,
 	)
 	if db.UsageOnlyStorageEnabled() {
-		write.Signals = SessionSignalUpdate{}
+		write.Signals = usageOnlySignalUpdate()
 		write.Findings = nil
 		write.SkipSignalUpdates = false
 	}

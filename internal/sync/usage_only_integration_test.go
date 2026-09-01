@@ -269,6 +269,69 @@ func TestUsageOnlyStorageClaudeUserAppendStaysIncremental(t *testing.T) {
 	assert.Nil(t, stored.FirstMessage)
 }
 
+func TestUsageOnlyStorageSettlesLegacySignalBackfillOnce(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "legacy-usage.db")
+	seedDatabase, err := db.Open(path)
+	require.NoError(t, err)
+	startedAt := "2026-08-31T10:00:00Z"
+	require.NoError(t, seedDatabase.UpsertSession(db.Session{
+		ID: "legacy-signals", Project: "project", Agent: "claude",
+		Machine: "local", StartedAt: &startedAt, MessageCount: 1,
+	}))
+	require.NoError(t, seedDatabase.InsertMessages([]db.Message{{
+		SessionID: "legacy-signals", Ordinal: 0, Role: "assistant",
+		Model: "model-a", TokenUsage: []byte(`{"input_tokens":10,"output_tokens":2}`),
+	}}))
+	require.NoError(t, seedDatabase.UpdateSessionSignals(
+		"legacy-signals", db.SessionSignalUpdate{
+			ToolFailureSignalCount: 3,
+			Outcome:                "failure",
+			QualitySignals: db.QualitySignals{
+				Version:          0,
+				ShortPromptCount: 2,
+			},
+		},
+	))
+	require.NoError(t, seedDatabase.ReplaceSessionSecretFindings(
+		"legacy-signals", nil, 2, "legacy-rules",
+	))
+	require.NoError(t, seedDatabase.Close())
+
+	database, err := db.OpenUsageOnly(path)
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, database.Close()) })
+
+	engine := sync.NewEngine(database, sync.EngineConfig{UsageOnly: true})
+	t.Cleanup(engine.Close)
+	compute := engine.BackfillSignalComputer()
+	calls := 0
+	runBackfill := func() {
+		require.NoError(t, database.BackfillSignals(
+			t.Context(), func(ctx context.Context, sessionID string) error {
+				calls++
+				return compute(ctx, sessionID)
+			},
+		))
+	}
+
+	runBackfill()
+	require.Equal(t, 1, calls)
+	stored, err := database.GetSessionFull(t.Context(), "legacy-signals")
+	require.NoError(t, err)
+	require.NotNil(t, stored)
+	assert.Equal(t, db.CurrentQualitySignalVersion, stored.QualitySignalVersion)
+	assert.Zero(t, stored.ToolFailureSignalCount)
+	assert.Empty(t, stored.Outcome)
+	assert.Zero(t, stored.ShortPromptCount)
+	assert.Zero(t, stored.SecretLeakCount)
+	assert.Empty(t, stored.SecretsRulesVersion)
+
+	calls = 0
+	runBackfill()
+	assert.Zero(t, calls,
+		"the current marker must keep later startups from revisiting the row")
+}
+
 func TestUsageOnlyStoragePreservesNestedToolLinkedSubagentUsage(
 	t *testing.T,
 ) {

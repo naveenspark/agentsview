@@ -47,6 +47,8 @@ func TestUsageOnlyStoragePolicyOwnsDirectAndBatchWrites(t *testing.T) {
 		SessionName: &privateTitle, StartedAt: &startedAt,
 		MessageCount: 4, UserMessageCount: 1,
 		SecretLeakCount: 2, SecretsRulesVersion: "private-rules",
+		ToolFailureSignalCount: 3, Outcome: "failure",
+		QualitySignalVersion: CurrentQualitySignalVersion,
 	}
 	require.NoError(t, database.UpsertSession(session))
 	require.NoError(t, database.ReplaceSessionMessages(session.ID, []Message{
@@ -55,6 +57,24 @@ func TestUsageOnlyStoragePolicyOwnsDirectAndBatchWrites(t *testing.T) {
 		{SessionID: session.ID, Ordinal: 2, Role: "assistant", Model: "model-a", Content: "private response"},
 		{SessionID: session.ID, Ordinal: 3, Role: "assistant", Model: "model-a", Content: "private billed response", TokenUsage: []byte(`{"input_tokens":10,"output_tokens":2}`)},
 	}))
+	require.NoError(t, database.UpdateSessionSignals(
+		session.ID, SessionSignalUpdate{
+			ToolFailureSignalCount: 4,
+			Outcome:                "failure",
+			QualitySignals: QualitySignals{
+				ShortPromptCount: 3,
+			},
+		},
+	))
+	require.NoError(t, database.ReplaceSessionSecretFindings(
+		session.ID,
+		[]SecretFinding{{
+			SessionID: session.ID,
+			RuleName:  "private-secret-rule",
+		}},
+		1,
+		"private-rules",
+	))
 
 	assertUsageOnlyStoredSession(t, database, session.ID, []int{2, 3})
 	replacementTitle := "title added after the initial import"
@@ -197,6 +217,14 @@ func assertUsageOnlyStoredSession(
 	assert.Nil(t, session.SessionName)
 	assert.Zero(t, session.SecretLeakCount)
 	assert.Empty(t, session.SecretsRulesVersion)
+	assert.Zero(t, session.ToolFailureSignalCount)
+	assert.Empty(t, session.Outcome)
+	assert.Equal(t, CurrentQualitySignalVersion, session.QualitySignalVersion)
+	findings, err := database.SessionSecretFindings(
+		context.Background(), sessionID,
+	)
+	require.NoError(t, err)
+	assert.Empty(t, findings)
 
 	messages, err := database.GetAllMessages(context.Background(), sessionID)
 	require.NoError(t, err)
