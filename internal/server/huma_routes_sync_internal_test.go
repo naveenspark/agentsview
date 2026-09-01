@@ -1520,7 +1520,8 @@ func TestSyncEngineForLocalCarriesUsageOnlyStoragePolicy(t *testing.T) {
 
 	messages, err := f.db.GetAllMessages(t.Context(), page.Sessions[0].ID)
 	require.NoError(t, err)
-	require.NotEmpty(t, messages)
+	assert.Empty(t, messages,
+		"a session without usage or assistant activity needs no message rows")
 	for _, message := range messages {
 		assert.Empty(t, message.Content)
 		assert.Empty(t, message.ThinkingText)

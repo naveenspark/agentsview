@@ -47,9 +47,10 @@ synced into AgentsView's archive and is not pushed to PostgreSQL.
 ### Usage-only archives
 
 Set `AGENTSVIEW_USAGE_ONLY=1` for an archive dedicated to token and cost
-reporting. AgentsView keeps session timing, model, and token-accounting metadata
-while omitting message text, thinking text, tool calls, tool results, and
-content-derived session titles.
+reporting. AgentsView keeps session timing plus the message rows required for
+token accounting and assistant-activity counts. Retained rows omit message
+text, thinking text, tool calls, tool results, and content-derived session
+titles; unrelated message rows are discarded.
 
 Use a separate data directory for this profile:
 

@@ -1301,7 +1301,11 @@ func truncateLogFile(path string, limit int64) {
 
 func openDB(cfg config.Config) (*db.DB, error) {
 	applyClassifierConfig(cfg)
-	database, err := db.Open(cfg.DBPath)
+	openArchive := db.Open
+	if cfg.UsageOnly {
+		openArchive = db.OpenUsageOnly
+	}
+	database, err := openArchive(cfg.DBPath)
 	if err != nil {
 		return nil, err
 	}

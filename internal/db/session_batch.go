@@ -132,6 +132,14 @@ func (db *DB) WriteSessionBatchContext(
 		if err != nil {
 			return result, err
 		}
+		write.Session, write.Messages = db.sessionAndMessagesForStorage(
+			write.Session, write.Messages,
+		)
+		if db.UsageOnlyStorageEnabled() {
+			write.Signals = SessionSignalUpdate{}
+			write.Findings = nil
+			write.SkipSignalUpdates = false
+		}
 		savepoint := fmt.Sprintf("session_batch_%d", i)
 		if _, err := ctxTx.Exec("SAVEPOINT " + savepoint); err != nil {
 			return result, fmt.Errorf(
@@ -144,6 +152,7 @@ func (db *DB) WriteSessionBatchContext(
 			ctx, tx, ctxTx,
 			write,
 			&sessionRecallRevocations,
+			db.UsageOnlyStorageEnabled(),
 		)
 		switch {
 		case err == nil:
@@ -220,10 +229,19 @@ func (db *DB) WriteSessionBatchAtomic(
 
 	for i, write := range writes {
 		write = sanitizeSessionBatchWrite(write)
+		write.Session, write.Messages = db.sessionAndMessagesForStorage(
+			write.Session, write.Messages,
+		)
+		if db.UsageOnlyStorageEnabled() {
+			write.Signals = SessionSignalUpdate{}
+			write.Findings = nil
+			write.SkipSignalUpdates = false
+		}
 		messagesWritten, err := writeOneSessionBatchTx(
 			context.Background(), tx, tx,
 			write,
 			&pendingRecallRevocations,
+			db.UsageOnlyStorageEnabled(),
 		)
 		if err != nil {
 			result.WrittenSessions = 0
@@ -420,6 +438,7 @@ func writeOneSessionBatchTx(
 	queries transactionQueries,
 	write SessionBatchWrite,
 	pendingRecallRevocations *recallEvidenceRevocationEvents,
+	preserveAutomation bool,
 ) (int, error) {
 	if write.IdentityObservation.Project != "" {
 		normalized, err := normalizeProjectIdentityObservation(
@@ -585,10 +604,12 @@ func writeOneSessionBatchTx(
 			return 0, err
 		}
 	}
-	if err := updateSessionAutomationFromMessagesTx(
-		queries, write.Session.ID,
-	); err != nil {
-		return 0, err
+	if !preserveAutomation {
+		if err := updateSessionAutomationFromMessagesTx(
+			queries, write.Session.ID,
+		); err != nil {
+			return 0, err
+		}
 	}
 
 	if write.DataVersion > 0 {

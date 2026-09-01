@@ -73,6 +73,14 @@ func (db *DB) applyArtifactImportedSession(
 		)
 	}
 	write = sanitizeSessionBatchWrite(write)
+	write.Session, write.Messages = db.sessionAndMessagesForStorage(
+		write.Session, write.Messages,
+	)
+	if db.UsageOnlyStorageEnabled() {
+		write.Signals = SessionSignalUpdate{}
+		write.Findings = nil
+		write.SkipSignalUpdates = false
+	}
 
 	db.mu.Lock()
 	defer db.mu.Unlock()
@@ -112,6 +120,7 @@ func (db *DB) applyArtifactImportedSession(
 	ctxTx := contextTransaction{ctx: ctx, tx: tx}
 	messagesWritten, err := writeOneSessionBatchTx(
 		ctx, tx, ctxTx, write, &pendingRecallRevocations,
+		db.UsageOnlyStorageEnabled(),
 	)
 	switch {
 	case err == nil:

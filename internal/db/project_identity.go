@@ -782,6 +782,7 @@ func (db *DB) upsertSessionWithProjectIdentity(
 	snapshotProject string,
 	reviveSourceMissing bool,
 ) (sessionUpsertResult, error) {
+	s = db.sessionForStorage(s)
 	if err := db.requireWritable(); err != nil {
 		return sessionUpsertResult{}, err
 	}

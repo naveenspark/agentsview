@@ -1500,6 +1500,7 @@ func (db *DB) UpsertSessionPendingContent(s Session) (bool, error) {
 func (db *DB) upsertSession(
 	s Session, reviveSourceMissing bool,
 ) (sessionUpsertResult, error) {
+	s = db.sessionForStorage(s)
 	db.mu.Lock()
 	defer db.mu.Unlock()
 	writer := db.getWriter()
@@ -2357,6 +2358,9 @@ func (db *DB) BumpLocalModifiedAt(id string) error {
 // full UpsertSession is unsafe because the caller does not have a complete
 // row to avoid overwriting existing fields with zero values.
 func (db *DB) RefreshSessionName(id string, sessionName *string) error {
+	if db.UsageOnlyStorageEnabled() {
+		sessionName = nil
+	}
 	if sessionName != nil {
 		clean := *sessionName
 		var stats ValidationStats
@@ -2900,8 +2904,10 @@ func (db *DB) UpdateSessionIncremental(
 	if err != nil {
 		return err
 	}
-	if err := updateSessionAutomationFromMessagesTx(tx, id); err != nil {
-		return err
+	if !db.UsageOnlyStorageEnabled() {
+		if err := updateSessionAutomationFromMessagesTx(tx, id); err != nil {
+			return err
+		}
 	}
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("committing incremental update tx: %w", err)
@@ -5432,6 +5438,9 @@ func (db *DB) RestoreSession(id string) (int64, error) {
 // RenameSession sets or clears the display_name for a session.
 // Pass nil to clear a custom name (reverts to session_name or first_message).
 func (db *DB) RenameSession(id string, displayName *string) error {
+	if db.UsageOnlyStorageEnabled() {
+		displayName = nil
+	}
 	db.mu.Lock()
 	defer db.mu.Unlock()
 	_, err := db.getWriter().Exec(

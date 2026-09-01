@@ -847,6 +847,9 @@ func (e *Engine) ResetStagedProviderStatHashes() {
 func NewEngine(
 	database *db.DB, cfg EngineConfig,
 ) *Engine {
+	if cfg.UsageOnly {
+		database.EnableUsageOnlyStorage()
+	}
 	skipCache := make(map[string]int64)
 	if !cfg.Ephemeral {
 		if loaded, err := database.LoadSkippedFiles(); err == nil {
@@ -2953,7 +2956,11 @@ func (e *Engine) resyncBuildLocked(
 		"Opening temporary database",
 		"",
 	)
-	newDB, err := db.Open(tempPath)
+	openReplacement := db.Open
+	if e.usageOnly {
+		openReplacement = db.OpenUsageOnly
+	}
+	newDB, err := openReplacement(tempPath)
 	if err != nil {
 		log.Printf("resync: open temp db: %v", err)
 		restoreSkipCache()
@@ -15896,15 +15903,14 @@ func (e *Engine) writeBatchWithOutcomeContext(
 			}
 		}
 
-		storedMsgs := e.messagesForStorage(msgs)
 		var werr error
 		if replaceMessages && !e.disableSignalRecompute {
-			werr = e.db.ReplaceSessionContent(s.ID, storedMsgs, update, findings)
+			werr = e.db.ReplaceSessionContent(s.ID, msgs, update, findings)
 		} else if replaceMessages {
-			if storedMsgs == nil {
-				storedMsgs = []db.Message{}
+			if msgs == nil {
+				msgs = []db.Message{}
 			}
-			werr = e.db.ReplaceSessionMessages(s.ID, storedMsgs)
+			werr = e.db.ReplaceSessionMessages(s.ID, msgs)
 		} else {
 			werr = e.writeMessages(s.ID, msgs)
 		}
@@ -16984,8 +16990,8 @@ func (e *Engine) writeBatchBulkWithOutcomeContext(
 		identityObservation, hasIdentityObservation :=
 			e.projectIdentityObservationForWrite(pw, s)
 		writes = append(writes, db.SessionBatchWrite{
-			Session:     e.sessionForStorage(s),
-			Messages:    e.messagesForStorage(msgs),
+			Session:     s,
+			Messages:    msgs,
 			UsageEvents: usageEvents,
 			IdentityObservation: identityObservationOrZero(
 				identityObservation, hasIdentityObservation,
@@ -17234,7 +17240,6 @@ func (e *Engine) upsertSessionPendingContentForWrite(
 	pw pendingWrite,
 	s db.Session,
 ) (bool, error) {
-	s = e.sessionForStorage(s)
 	if pw.sourceIdentityUnverified {
 		return e.db.UpsertSessionPendingContent(s)
 	}
@@ -17627,8 +17632,6 @@ func (e *Engine) writeIncremental(
 	msgCount := inc.msgCount - filtered
 	userFiltered := countUserMsgs(inc.msgs) - newUser
 	userMsgCount := inc.userMsgCount - userFiltered
-	dbMsgs = e.messagesForStorage(dbMsgs)
-
 	var endedAt *string
 	if !inc.endedAt.IsZero() {
 		s := inc.endedAt.Format(time.RFC3339Nano)
@@ -17744,7 +17747,6 @@ func (e *Engine) writeIncremental(
 func (e *Engine) writeMessages(
 	sessionID string, msgs []db.Message,
 ) error {
-	msgs = e.messagesForStorage(msgs)
 	maxOrd := e.db.MaxOrdinal(sessionID)
 
 	// No existing messages — insert all.
@@ -17831,16 +17833,15 @@ func (e *Engine) writeSessionFullWithResolver(
 		log.Printf("upsert session %s: %v", s.ID, err)
 		return err
 	}
-	storedMsgs := e.messagesForStorage(msgs)
 	var replaceErr error
 	if e.disableSignalRecompute {
-		if storedMsgs == nil {
-			storedMsgs = []db.Message{}
+		if msgs == nil {
+			msgs = []db.Message{}
 		}
-		replaceErr = e.db.ReplaceSessionMessages(s.ID, storedMsgs)
+		replaceErr = e.db.ReplaceSessionMessages(s.ID, msgs)
 	} else {
 		update, findings := computeSignalsAndSecrets(s, msgs)
-		replaceErr = e.db.ReplaceSessionContent(s.ID, storedMsgs, update, findings)
+		replaceErr = e.db.ReplaceSessionContent(s.ID, msgs, update, findings)
 	}
 	if replaceErr != nil {
 		log.Printf(

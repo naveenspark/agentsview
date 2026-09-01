@@ -61,9 +61,13 @@ func TestUsageOnlyStoragePreservesUsageWithoutTranscriptContent(t *testing.T) {
 	claudeBuilder := testjsonl.NewSessionBuilder().
 		AddClaudeUserWithSessionID(
 			"2026-08-31T11:00:00Z",
-			"private Claude prompt that must stay in the source transcript",
+			"You are a code reviewer. Review the code changes shown below. private Claude prompt",
 			claudeSessionID,
 			"/workspace/private-project",
+		).
+		AddClaudeAssistant(
+			"2026-08-31T11:00:00.500Z",
+			"private unbilled Claude response",
 		).
 		AddClaudeAssistantUsage(
 			"2026-08-31T11:00:01Z",
@@ -119,6 +123,9 @@ func TestUsageOnlyStoragePreservesUsageWithoutTranscriptContent(t *testing.T) {
 	require.NoError(t, appendFile.Close())
 	fullEngine.SyncPathsContext(t.Context(), []string{claudePath})
 	usageEngine.SyncPathsContext(t.Context(), []string{claudePath})
+	resyncStats := usageEngine.ResyncAll(t.Context(), nil)
+	require.False(t, resyncStats.Aborted)
+	require.Zero(t, resyncStats.Failed)
 
 	for _, agent := range []string{"claude", "codex"} {
 		filter := db.UsageFilter{
@@ -134,6 +141,28 @@ func TestUsageOnlyStoragePreservesUsageWithoutTranscriptContent(t *testing.T) {
 		assert.Equal(t, fullUsage.Totals, usageOnlyUsage.Totals)
 		assert.Equal(t, fullUsage.Daily, usageOnlyUsage.Daily)
 		assert.Equal(t, fullUsage.SessionCounts, usageOnlyUsage.SessionCounts)
+
+		fullMatching, err := fullDB.GetUsageMatchingSessionCount(
+			context.Background(), filter,
+		)
+		require.NoError(t, err)
+		usageOnlyMatching, err := usageDB.GetUsageMatchingSessionCount(
+			context.Background(), filter,
+		)
+		require.NoError(t, err)
+		assert.Equal(t, fullMatching, usageOnlyMatching)
+
+		automatedFilter := filter
+		automatedFilter.AutomatedScope = "automated"
+		fullAutomated, err := fullDB.GetDailyUsage(
+			context.Background(), automatedFilter,
+		)
+		require.NoError(t, err)
+		usageOnlyAutomated, err := usageDB.GetDailyUsage(
+			context.Background(), automatedFilter,
+		)
+		require.NoError(t, err)
+		assert.Equal(t, fullAutomated, usageOnlyAutomated)
 	}
 
 	messages, err := usageDB.GetAllMessages(context.Background(), "codex:"+sessionID)
@@ -172,8 +201,15 @@ func TestUsageOnlyStoragePreservesUsageWithoutTranscriptContent(t *testing.T) {
 		context.Background(), claudeSessionID,
 	)
 	require.NoError(t, err)
-	require.Len(t, usageClaudeMessages, len(fullClaudeMessages))
+	require.Less(t, len(usageClaudeMessages), len(fullClaudeMessages),
+		"usage-only storage must omit rows unrelated to accounting")
 	for _, message := range usageClaudeMessages {
+		assert.True(t,
+			(message.TokenUsage != nil && message.Model != "" &&
+				message.Model != "<synthetic>") ||
+				(message.Role == "assistant" && message.Model != "<synthetic>"),
+			"stored message %d is unrelated to usage accounting", message.Ordinal,
+		)
 		assert.Empty(t, message.Content)
 		assert.Empty(t, message.ThinkingText)
 		assert.Empty(t, message.ToolCalls)
