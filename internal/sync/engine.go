@@ -488,6 +488,10 @@ type EngineConfig struct {
 	// StableSourceSnapshots reports that configured source files are immutable
 	// for this engine. Bounded capture sets it after copying quiescent sources.
 	StableSourceSnapshots bool
+	// UsageOnly keeps token-accounting metadata while omitting transcript
+	// bodies, thinking text, tool payloads, and content-derived titles. It is
+	// intended for isolated reporting archives, not the session viewer.
+	UsageOnly bool
 	// Emitter, when non-nil, is called once after each sync pass
 	// that wrote data. Safe to leave nil (e.g., in PG serve mode
 	// where the engine is not run).
@@ -574,6 +578,7 @@ type Engine struct {
 	disableSignalRecompute  bool
 	disableProjectDiscovery bool
 	stableSourceSnapshots   bool
+	usageOnly               bool
 	idPrefix                string
 	pathRewriter            func(string) string
 	storedPathResolver      func(string) (string, bool)
@@ -910,9 +915,10 @@ func NewEngine(
 		s3CodexIndexCache:       make(map[string]s3CodexIndexSnapshot),
 		ephemeral:               cfg.Ephemeral,
 		discardWritesOnCancel:   cfg.DiscardPendingWritesOnCancel,
-		disableSignalRecompute:  cfg.DisableSignalRecomputation,
+		disableSignalRecompute:  cfg.DisableSignalRecomputation || cfg.UsageOnly,
 		disableProjectDiscovery: cfg.DisableFilesystemProjectDiscovery,
 		stableSourceSnapshots:   cfg.StableSourceSnapshots,
+		usageOnly:               cfg.UsageOnly,
 		idPrefix:                cfg.IDPrefix,
 		pathRewriter:            cfg.PathRewriter,
 		storedPathResolver:      cfg.StoredPathResolver,
@@ -15890,14 +15896,15 @@ func (e *Engine) writeBatchWithOutcomeContext(
 			}
 		}
 
+		storedMsgs := e.messagesForStorage(msgs)
 		var werr error
 		if replaceMessages && !e.disableSignalRecompute {
-			werr = e.db.ReplaceSessionContent(s.ID, msgs, update, findings)
+			werr = e.db.ReplaceSessionContent(s.ID, storedMsgs, update, findings)
 		} else if replaceMessages {
-			if msgs == nil {
-				msgs = []db.Message{}
+			if storedMsgs == nil {
+				storedMsgs = []db.Message{}
 			}
-			werr = e.db.ReplaceSessionMessages(s.ID, msgs)
+			werr = e.db.ReplaceSessionMessages(s.ID, storedMsgs)
 		} else {
 			werr = e.writeMessages(s.ID, msgs)
 		}
@@ -16974,12 +16981,14 @@ func (e *Engine) writeBatchBulkWithOutcomeContext(
 		if usageErr != nil {
 			return outcome
 		}
+		identityObservation, hasIdentityObservation :=
+			e.projectIdentityObservationForWrite(pw, s)
 		writes = append(writes, db.SessionBatchWrite{
-			Session:     s,
-			Messages:    msgs,
+			Session:     e.sessionForStorage(s),
+			Messages:    e.messagesForStorage(msgs),
 			UsageEvents: usageEvents,
 			IdentityObservation: identityObservationOrZero(
-				e.projectIdentityObservationForWrite(pw, s),
+				identityObservation, hasIdentityObservation,
 			),
 			IdentitySnapshotProject: &snapshotProject,
 			Signals:                 update,
@@ -17225,6 +17234,7 @@ func (e *Engine) upsertSessionPendingContentForWrite(
 	pw pendingWrite,
 	s db.Session,
 ) (bool, error) {
+	s = e.sessionForStorage(s)
 	if pw.sourceIdentityUnverified {
 		return e.db.UpsertSessionPendingContent(s)
 	}
@@ -17617,6 +17627,7 @@ func (e *Engine) writeIncremental(
 	msgCount := inc.msgCount - filtered
 	userFiltered := countUserMsgs(inc.msgs) - newUser
 	userMsgCount := inc.userMsgCount - userFiltered
+	dbMsgs = e.messagesForStorage(dbMsgs)
 
 	var endedAt *string
 	if !inc.endedAt.IsZero() {
@@ -17637,21 +17648,24 @@ func (e *Engine) writeIncremental(
 	// since a long session legitimately exceeds it.
 	endedAt, _ = blankImplausibleTimestampPtr(endedAt)
 
-	subagentLinks := make([]db.ToolCallSubagentLink, len(inc.links))
-	for i, link := range inc.links {
-		toolCall := db.ToolCall{
-			ResultContent:       parser.DecodeContent(link.ResultContentRaw),
-			ResultContentLength: link.ResultContentLen,
-		}
-		e.anomalies.recordSanitize(db.SanitizeToolCall(&toolCall))
-		subagentLinks[i] = db.ToolCallSubagentLink{
-			ToolUseID: link.ToolUseID,
-			SubagentSessionID: applyIDPrefixToID(
-				e.idPrefix, link.SubagentSessionID,
-			),
-			ResultContent:    toolCall.ResultContent,
-			ResultContentLen: toolCall.ResultContentLength,
-			HasResult:        link.HasResult,
+	var subagentLinks []db.ToolCallSubagentLink
+	if !e.usageOnly {
+		subagentLinks = make([]db.ToolCallSubagentLink, len(inc.links))
+		for i, link := range inc.links {
+			toolCall := db.ToolCall{
+				ResultContent:       parser.DecodeContent(link.ResultContentRaw),
+				ResultContentLength: link.ResultContentLen,
+			}
+			e.anomalies.recordSanitize(db.SanitizeToolCall(&toolCall))
+			subagentLinks[i] = db.ToolCallSubagentLink{
+				ToolUseID: link.ToolUseID,
+				SubagentSessionID: applyIDPrefixToID(
+					e.idPrefix, link.SubagentSessionID,
+				),
+				ResultContent:    toolCall.ResultContent,
+				ResultContentLen: toolCall.ResultContentLength,
+				HasResult:        link.HasResult,
+			}
 		}
 	}
 
@@ -17730,6 +17744,7 @@ func (e *Engine) writeIncremental(
 func (e *Engine) writeMessages(
 	sessionID string, msgs []db.Message,
 ) error {
+	msgs = e.messagesForStorage(msgs)
 	maxOrd := e.db.MaxOrdinal(sessionID)
 
 	// No existing messages — insert all.
@@ -17816,15 +17831,16 @@ func (e *Engine) writeSessionFullWithResolver(
 		log.Printf("upsert session %s: %v", s.ID, err)
 		return err
 	}
+	storedMsgs := e.messagesForStorage(msgs)
 	var replaceErr error
 	if e.disableSignalRecompute {
-		if msgs == nil {
-			msgs = []db.Message{}
+		if storedMsgs == nil {
+			storedMsgs = []db.Message{}
 		}
-		replaceErr = e.db.ReplaceSessionMessages(s.ID, msgs)
+		replaceErr = e.db.ReplaceSessionMessages(s.ID, storedMsgs)
 	} else {
 		update, findings := computeSignalsAndSecrets(s, msgs)
-		replaceErr = e.db.ReplaceSessionContent(s.ID, msgs, update, findings)
+		replaceErr = e.db.ReplaceSessionContent(s.ID, storedMsgs, update, findings)
 	}
 	if replaceErr != nil {
 		log.Printf(

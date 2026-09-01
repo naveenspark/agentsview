@@ -303,6 +303,7 @@ func runServe(cfg config.Config, opts serveOptions) {
 			ScanProtectedPaths:      cfg.ScanProtectedPaths,
 			Machine:                 cfg.LocalMachineName,
 			BlockedResultCategories: cfg.ResultContentBlockedCategories,
+			UsageOnly:               cfg.UsageOnly,
 			Emitter:                 emitter,
 			DeferStartupMaintenance: deferStartupMaintenance(
 				opts.SkipInitialSync, workerSyncDone,
@@ -430,6 +431,7 @@ func runServe(cfg config.Config, opts serveOptions) {
 		identityBackfillEngine = sync.NewEngine(database, sync.EngineConfig{
 			Machine:            cfg.LocalMachineName,
 			ScanProtectedPaths: cfg.ScanProtectedPaths,
+			UsageOnly:          cfg.UsageOnly,
 		})
 	}
 	go idleTracker.Do(func() {

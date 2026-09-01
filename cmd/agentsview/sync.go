@@ -974,6 +974,7 @@ func coordinateLocalSync(
 		ScanProtectedPaths:      appCfg.ScanProtectedPaths,
 		Machine:                 appCfg.LocalMachineName,
 		BlockedResultCategories: appCfg.ResultContentBlockedCategories,
+		UsageOnly:               appCfg.UsageOnly,
 	})
 	defer engine.Close()
 
