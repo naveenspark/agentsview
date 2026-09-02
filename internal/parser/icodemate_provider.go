@@ -21,9 +21,10 @@ import (
 // roots fall through to the generic directory plan.
 
 var (
-	_ Provider                     = (*icodemateProvider)(nil)
-	_ StreamingDiscoverer          = (*icodemateProvider)(nil)
-	_ ChangedPathRelevanceProvider = (*icodemateProvider)(nil)
+	_ Provider                          = (*icodemateProvider)(nil)
+	_ StreamingDiscoverer               = (*icodemateProvider)(nil)
+	_ ChangedPathRelevanceProvider      = (*icodemateProvider)(nil)
+	_ ReconciliationSourceStateResolver = (*icodemateProvider)(nil)
 )
 
 type icodemateProviderFactory struct {
@@ -52,7 +53,7 @@ func (f icodemateProviderFactory) NewProvider(cfg ProviderConfig) Provider {
 			sources: newOpenCodeFormatSourceSet(
 				opencodeRoots,
 				openCodeProviderSpecForAgent(AgentIcodemate),
-				cfg.SQLiteContainerUnchangedSinceTrust,
+				cfg.SQLiteContainerListsWatermarkOnly,
 			),
 		},
 		cli:      newIcodemateCLISourceSet(cliRoots),
@@ -66,7 +67,7 @@ func (f icodemateProviderFactory) NewProvider(cfg ProviderConfig) Provider {
 		allSources: newOpenCodeFormatSourceSet(
 			cfg.Roots,
 			openCodeProviderSpecForAgent(AgentIcodemate),
-			cfg.SQLiteContainerUnchangedSinceTrust,
+			cfg.SQLiteContainerListsWatermarkOnly,
 		),
 	}
 	provider.ProviderBase = ProviderBase{
@@ -262,6 +263,26 @@ func (p *icodemateProvider) SourceForReconciliation(
 	ctx context.Context, path, project string,
 ) (SourceRef, bool, error) {
 	return p.allSources.SourceForReconciliation(ctx, path, project)
+}
+
+func (p *icodemateProvider) SourceForReconciliationWithState(
+	ctx context.Context, path, project string, state ReconciliationSourceState,
+) (SourceRef, bool, error) {
+	return p.allSources.SourceForReconciliationWithState(
+		ctx, path, project, state,
+	)
+}
+
+func (p *icodemateProvider) ReconciliationSourceState(
+	source SourceRef,
+) (ReconciliationSourceState, bool) {
+	return p.allSources.reconciliationSourceState(source)
+}
+
+func (p *icodemateProvider) ApplyReconciliationSourceState(
+	source *SourceRef, state ReconciliationSourceState,
+) error {
+	return p.allSources.applyReconciliationSourceState(source, state)
 }
 
 // ResolveReconciliationScopes preserves the OpenCode container topology for

@@ -681,13 +681,14 @@ type Engine struct {
 
 	// containerMu guards the OpenCode-family shared-SQLite freshness
 	// gate (see opencode_container_gate.go). trustedSQLiteContainers
-	// maps a container DB path to its state and verified session-ID
-	// set at the end of the last pass that verified every one of its
-	// discovered sessions; containerPass is the bookkeeping for the
-	// pass currently running (nil outside passes). Both are in-memory
+	// maps a container DB path to its state at the end of the last
+	// completed pass; digestVerifiedAt records when that container last
+	// completed a full composite listing. containerPass is the bookkeeping
+	// for the pass currently running (nil outside passes). All are in-memory
 	// only: a restart re-verifies once.
 	containerMu             gosync.Mutex
 	trustedSQLiteContainers map[string]trustedSQLiteContainer
+	digestVerifiedAt        map[string]time.Time
 	containerPass           *sqliteContainerPass
 
 	// storageTrustMu guards the per-session freshness gate for
@@ -931,6 +932,7 @@ func NewEngine(
 		providerMigrationModes:  providerModes,
 		providerStatHashers: buildProviderStatHashers(
 			providerFactoryMap(providerFactories)),
+		digestVerifiedAt:        make(map[string]time.Time),
 		providerWatchRoots:      make(map[parser.AgentType][]parser.WatchRoot),
 		projectIdentityCache:    make(map[string]projectIdentityCacheEntry),
 		projectIdentityWritten:  make(map[string]struct{}),
@@ -1666,20 +1668,29 @@ func (e *Engine) applyChangedPathSyncLocked(
 		ctx, results, len(prepared.files), len(prepared.files), nil,
 		syncWriteDefault,
 	)
-	e.finishSQLiteContainerPass(true, false)
 	e.anomalies.applyTo(&stats)
 	e.persistSkipCache()
 	complete := prepared.classificationErr == nil && ctx.Err() == nil &&
 		stats.ProcessingComplete()
 	tombstoned := 0
+	var tombstoneErr error
 	if complete && len(prepared.missingPaths) > 0 {
-		var err error
-		tombstoned, err = e.tombstoneMissingWatchSourcesLocked(
+		tombstoned, tombstoneErr = e.tombstoneMissingWatchSourcesLocked(
 			ctx, prepared.missingPaths, nil,
 		)
-		if err != nil {
-			return stats, tombstoned, fmt.Errorf("watcher source reconciliation: %w", err)
-		}
+	}
+	// The pass stays open through tombstoning so a late pass-level failure
+	// still reaches finalization. Such failures cannot be attributed to a
+	// container, so they poison the whole capture; a clean subset keeps its
+	// verification age and, being partial, never promotes.
+	if !complete || tombstoneErr != nil {
+		e.poisonSQLiteContainerPass()
+	}
+	e.finishSQLiteContainerPass(true, false)
+	if tombstoneErr != nil {
+		return stats, tombstoned, fmt.Errorf(
+			"watcher source reconciliation: %w", tombstoneErr,
+		)
 	}
 	e.mu.Lock()
 	e.lastSync = time.Now()
@@ -5008,6 +5019,17 @@ func (e *Engine) reconcileWatchRootsStreamedLocked(
 	}()
 
 	preContainerStates := e.capturePlannedSQLiteContainerStates(plans, fullCoverage)
+	e.beginStreamingSQLiteContainerPass(preContainerStates)
+	defer func() {
+		// Failures here cannot be attributed to one container, so they
+		// poison the whole captured set; a clean pass finalizes normally
+		// with promotion gated per container.
+		if retErr != nil || stats.Aborted || stats.Failed > 0 ||
+			stats.providerFailures > 0 {
+			e.poisonSQLiteContainerPass()
+		}
+		e.finishSQLiteContainerPass(false, fullCoverage)
+	}()
 	providers, completedScopes, failedRoots,
 		failures, discoveryErr, err := e.streamReconciliationCandidates(
 		ctx, plans, spool, preContainerStates,
@@ -5022,6 +5044,7 @@ func (e *Engine) reconcileWatchRootsStreamedLocked(
 		cleaned = true
 		return stats, metrics, 0, eligibility, err
 	}
+	e.finishStreamingSQLiteContainerDiscovery()
 	authoritativeProviders := make(map[parser.AgentType]struct{}, len(completedScopes))
 	for _, completed := range completedScopes {
 		authoritativeProviders[completed.agent] = struct{}{}
@@ -5036,15 +5059,6 @@ func (e *Engine) reconcileWatchRootsStreamedLocked(
 			authoritativeProviders[parser.AgentFreebuff] = struct{}{}
 		}
 	}
-	e.beginStreamingSQLiteContainerPass(preContainerStates)
-	e.finishStreamingSQLiteContainerDiscovery()
-	defer func() {
-		e.finishSQLiteContainerPass(
-			retErr != nil || stats.Aborted || stats.Failed > 0 || stats.providerFailures > 0,
-			fullCoverage,
-		)
-	}()
-
 	var verifiedPass uint64
 	if fullCoverage && e.pathRewriter == nil {
 		verifiedPass = e.beginVerifiedSourcePass()
@@ -5070,12 +5084,6 @@ func (e *Engine) reconcileWatchRootsStreamedLocked(
 		}
 		if len(page) == 0 {
 			break
-		}
-		for _, candidate := range page {
-			e.noteSQLiteContainerDiscovery(parser.DiscoveredFile{
-				Agent: candidate.Provider,
-				Path:  candidate.Path,
-			})
 		}
 		files, err := e.rehydrateReconciliationPage(
 			ctx, page, providers, force,
@@ -5587,7 +5595,9 @@ func (e *Engine) streamReconciliationCandidates(
 	// nothing reads. The predicate is keyed to this pass's pre-discovery
 	// captures; a container that changes mid-stream fails its recapture
 	// check and its candidates resolve full fingerprints instead.
-	containerTrusted := e.sqliteContainerTrustedForDiscovery(preContainerStates)
+	containerListsWatermarkOnly := e.sqliteContainerListsWatermarkOnly(
+		preContainerStates,
+	)
 	for _, plan := range plans {
 		agent := plan.agent
 		if plan.err != nil {
@@ -5624,8 +5634,8 @@ func (e *Engine) streamReconciliationCandidates(
 		}
 		provider := factory.NewProvider(parser.ProviderConfig{
 			Roots: traversalRoots, Machine: e.machine, PathRewriter: e.pathRewriter,
-			SourceMachines:                     e.sourceMachines[agent],
-			SQLiteContainerUnchangedSinceTrust: containerTrusted,
+			SourceMachines:                    e.sourceMachines[agent],
+			SQLiteContainerListsWatermarkOnly: containerListsWatermarkOnly,
 		})
 		providers[agent] = provider
 		if provider.Capabilities().Source.StreamingDiscovery != parser.CapabilitySupported {
@@ -5657,9 +5667,9 @@ func (e *Engine) streamReconciliationCandidates(
 			}
 			scopeProvider := factory.NewProvider(parser.ProviderConfig{
 				Roots: discoveryRoots, Machine: e.machine,
-				SourceMachines:                     e.sourceMachines[agent],
-				PathRewriter:                       e.pathRewriter,
-				SQLiteContainerUnchangedSinceTrust: containerTrusted,
+				SourceMachines:                    e.sourceMachines[agent],
+				PathRewriter:                      e.pathRewriter,
+				SQLiteContainerListsWatermarkOnly: containerListsWatermarkOnly,
 			})
 			discoverer, ok := scopeProvider.(parser.StreamingDiscoverer)
 			if !ok {
@@ -5722,6 +5732,22 @@ func (e *Engine) streamReconciliationCandidates(
 					)
 				}
 				spoolErr = spool.Add(ctx, candidate)
+				if spoolErr == nil {
+					replaced, replacedOK := spool.LastAddReplaced()
+					if replacedOK {
+						e.unNoteSQLiteContainerDiscovery(parser.DiscoveredFile{
+							Agent: replaced.Provider,
+							Path:  replaced.Path,
+						})
+					}
+					if spool.LastAddWon() || replacedOK {
+						e.noteSQLiteContainerDiscovery(parser.DiscoveredFile{
+							Agent:          candidate.Provider,
+							Path:           candidate.Path,
+							ProviderSource: &source,
+						})
+					}
+				}
 				return spoolErr
 			})
 			if err == nil && agent == parser.AgentKiro {
@@ -5984,13 +6010,20 @@ func (e *Engine) reconciliationCandidate(
 	if agent == parser.AgentAntigravityCLI {
 		preference2 = boolPreference(strings.HasSuffix(path, ".db"))
 	}
+	var sourceState parser.ReconciliationSourceState
+	if stateProvider, ok := provider.(parser.ReconciliationSourceStateProvider); ok {
+		if state, stateOK := stateProvider.ReconciliationSourceState(source); stateOK {
+			sourceState = state
+		}
+	}
 	return reconciliationCandidate{
 		Provider: agent, Identity: identity, Path: path,
 		StoredPath: canonicalReconciliationSourceIdentity(
 			e.effectiveSourcePath(path),
 		), MemberIdentity: source.ReconciliationIdentity, WatchRoot: root,
 		Machine: e.machineForProviderSource(agent, source, path),
-		Project: source.ProjectHint, Preference1: preference1,
+		Project: source.ProjectHint, SourceState: sourceState,
+		Preference1: preference1,
 		Preference2: preference2, Preference3: preference3,
 	}, true
 }
@@ -6114,6 +6147,7 @@ func (e *Engine) rehydrateReconciliationPage(
 	providers map[parser.AgentType]parser.Provider,
 	force bool,
 ) ([]parser.DiscoveredFile, error) {
+	e.refreshReconciliationPageContainerCaptures(page)
 	files := make([]parser.DiscoveredFile, 0, len(page))
 	for _, candidate := range page {
 		forceCandidate := force
@@ -6122,20 +6156,35 @@ func (e *Engine) rehydrateReconciliationPage(
 			return nil, fmt.Errorf("rehydrate %s source: provider unavailable", candidate.Provider)
 		}
 		if resolver, ok := provider.(parser.ReconciliationSourceResolver); ok {
-			source, found, err := resolver.SourceForReconciliation(
-				ctx, candidate.Path, candidate.Project,
-			)
+			var source parser.SourceRef
+			var found bool
+			var err error
+			if stateResolver, stateOK := provider.(parser.ReconciliationSourceStateResolver); stateOK &&
+				candidate.SourceState.Version != 0 {
+				source, found, err = stateResolver.SourceForReconciliationWithState(
+					ctx, candidate.Path, candidate.Project, candidate.SourceState,
+				)
+			} else {
+				source, found, err = resolver.SourceForReconciliation(
+					ctx, candidate.Path, candidate.Project,
+				)
+			}
 			if err != nil {
 				return nil, fmt.Errorf("rehydrate %s source %s: %w", candidate.Provider, candidate.Path, err)
 			}
 			if found && reconciliationSourceIdentity(candidate.Provider, source) == candidate.Identity {
-				files = append(files, parser.DiscoveredFile{
-					Path: candidate.Path, Project: source.ProjectHint,
-					Agent: candidate.Provider, ForceParse: forceCandidate,
-					Machine:        candidate.Machine,
-					ProviderSource: &source, ProviderProcess: true,
-				})
-				continue
+				if e.applyReconciliationSourceStateIfValid(
+					provider, &source, candidate.SourceState,
+					candidate.Provider, candidate.Path,
+				) {
+					files = append(files, parser.DiscoveredFile{
+						Path: candidate.Path, Project: source.ProjectHint,
+						Agent: candidate.Provider, ForceParse: forceCandidate,
+						Machine:        candidate.Machine,
+						ProviderSource: &source, ProviderProcess: true,
+					})
+					continue
+				}
 			}
 		}
 		sources, err := provider.SourcesForChangedPath(ctx, parser.ChangedPathRequest{
@@ -6156,6 +6205,10 @@ func (e *Engine) rehydrateReconciliationPage(
 			return nil, fmt.Errorf("rehydrate %s source %s: canonical source not found", candidate.Provider, candidate.Path)
 		}
 		source := *matched
+		_ = e.applyReconciliationSourceStateIfValid(
+			provider, &source, candidate.SourceState,
+			candidate.Provider, candidate.Path,
+		)
 		files = append(files, parser.DiscoveredFile{
 			Path: candidate.Path, Project: source.ProjectHint,
 			Agent: candidate.Provider, ForceParse: forceCandidate,
@@ -6167,6 +6220,91 @@ func (e *Engine) rehydrateReconciliationPage(
 		})
 	}
 	return files, nil
+}
+
+// refreshReconciliationPageContainerCaptures invalidates SQLite container
+// captures that changed after discovery and before a spool page was rehydrated.
+// This keeps a full child digest from becoming stale while it is still being
+// used to avoid per-member child lookups.
+func (e *Engine) refreshReconciliationPageContainerCaptures(
+	page []reconciliationCandidate,
+) {
+	e.containerMu.Lock()
+	pass := e.containerPass
+	if pass == nil {
+		e.containerMu.Unlock()
+		return
+	}
+	expected := make(map[string]parser.SQLiteContainerState)
+	for _, candidate := range page {
+		dbPath, _, ok := sqliteContainerSourceForFile(parser.DiscoveredFile{
+			Agent: candidate.Provider, Path: candidate.Path,
+		})
+		if !ok || pass.failed[dbPath] {
+			continue
+		}
+		state, captured := pass.captured[dbPath]
+		if !captured {
+			pass.failed[dbPath] = true
+			continue
+		}
+		expected[dbPath] = state
+	}
+	e.containerMu.Unlock()
+
+	for dbPath, before := range expected {
+		after, ok := statSQLiteContainerState(dbPath)
+		if ok && after == before {
+			continue
+		}
+		e.containerMu.Lock()
+		if e.containerPass == pass {
+			pass.failed[dbPath] = true
+		}
+		e.containerMu.Unlock()
+	}
+}
+
+// applyReconciliationSourceStateIfValid treats provider state as an optional
+// optimization. Missing, malformed, or stale state falls through to the
+// authoritative changed-path source resolution instead of aborting
+// reconciliation. The container capture check keys on the RESOLVED source
+// representation, not the candidate path: resolution may have promoted a
+// virtual SQLite member to its canonical storage shadow, whose parse does
+// not depend on the container, and rejecting it here would send it to a
+// path-matching fallback that cannot match the promoted path.
+func (e *Engine) applyReconciliationSourceStateIfValid(
+	provider parser.Provider,
+	source *parser.SourceRef,
+	state parser.ReconciliationSourceState,
+	agent parser.AgentType,
+	path string,
+) bool {
+	if source == nil {
+		return false
+	}
+	if state.Version == 0 {
+		return true
+	}
+	resolvedPath := providerDiscoveredPath(*source)
+	if resolvedPath == "" {
+		resolvedPath = path
+	}
+	if dbPath, _, ok := sqliteContainerSourceForFile(parser.DiscoveredFile{
+		Agent: agent, Path: resolvedPath,
+	}); ok {
+		e.containerMu.Lock()
+		passActive := e.containerPass != nil
+		e.containerMu.Unlock()
+		if passActive && !e.sqliteContainerPassCaptureStillCurrent(dbPath) {
+			return false
+		}
+	}
+	stateProvider, ok := provider.(parser.ReconciliationSourceStateProvider)
+	if !ok {
+		return false
+	}
+	return stateProvider.ApplyReconciliationSourceState(source, state) == nil
 }
 
 func canonicalReconciliationSourceIdentity(value string) string {
@@ -7335,7 +7473,7 @@ func (e *Engine) syncAllLocked(
 		// the newest surviving duplicate before falling back to normal layout
 		// preference.
 		all = e.expandCodexProviderDuplicates(all, scope)
-		all = e.filterFilesByMtime(ctx, all, since)
+		all = e.filterQuickSyncFiles(ctx, all, since)
 	}
 
 	if quickSyncCutoff {
@@ -7400,13 +7538,13 @@ func (e *Engine) syncAllLocked(
 		stats.RecordFailed()
 	}
 	// Discovery failures cannot be attributed to a provider here, so any
-	// failure conservatively blocks every container promotion this pass.
-	// Only unscoped passes discovered every root, so only they may drop
-	// trusted entries for containers that produced no sources.
-	e.finishSQLiteContainerPass(
-		stats.Aborted || ctx.Err() != nil || providerFailures > 0,
-		scope == nil,
-	)
+	// failure conservatively poisons every captured verification this
+	// pass. Only unscoped passes discovered every root, so only they may
+	// drop trusted entries for containers that produced no sources.
+	if stats.Aborted || ctx.Err() != nil || providerFailures > 0 {
+		e.poisonSQLiteContainerPass()
+	}
+	e.finishSQLiteContainerPass(false, scope == nil)
 	if verifiedPass != 0 {
 		e.finishVerifiedSourcePass(
 			verifiedPass,
@@ -7586,7 +7724,9 @@ func (e *Engine) discoverProviderSources(
 ) ([]parser.DiscoveredFile, int) {
 	var files []parser.DiscoveredFile
 	var failures int
-	containerTrusted := e.sqliteContainerTrustedForDiscovery(preContainerStates)
+	containerListsWatermarkOnly := e.sqliteContainerListsWatermarkOnly(
+		preContainerStates,
+	)
 
 	agents := make([]parser.AgentType, 0, len(e.providerFactories))
 	for agent := range e.providerFactories {
@@ -7628,11 +7768,11 @@ func (e *Engine) discoverProviderSources(
 			providerRoots = roots
 		}
 		provider := factory.NewProvider(parser.ProviderConfig{
-			Roots:                              providerRoots,
-			Machine:                            e.machine,
-			SourceMachines:                     e.sourceMachines[agentType],
-			PathRewriter:                       e.pathRewriter,
-			SQLiteContainerUnchangedSinceTrust: containerTrusted,
+			Roots:                             providerRoots,
+			Machine:                           e.machine,
+			SourceMachines:                    e.sourceMachines[agentType],
+			PathRewriter:                      e.pathRewriter,
+			SQLiteContainerListsWatermarkOnly: containerListsWatermarkOnly,
 		})
 		// Shared-database providers are streamed source-by-source by their
 		// dedicated sync phase. Calling Discover here would build an archive-sized
@@ -10751,6 +10891,7 @@ func (e *Engine) processProviderFile(
 	if file.ProviderSource != nil && !file.ProviderProcess && !usesProvider {
 		return processResult{}, false
 	}
+	e.discardStaleSQLiteProviderSource(&file)
 
 	// OpenCode-family shared-SQLite gate: when the whole container
 	// provably has not changed since the last fully verified pass, none
@@ -10787,6 +10928,13 @@ func (e *Engine) processProviderFile(
 		PathRewriter:          e.pathRewriter,
 	})
 
+	// Re-apply the pass-failure check at the moment carried metadata is
+	// about to be trusted: another worker can fail the container after this
+	// file's capture recheck above, and the locked read keeps that mark
+	// from racing the fingerprint skip. A write landing after both checks
+	// is caught by finalization revalidation, which blocks promotion and
+	// clears verification so the next pass reconciles it.
+	e.discardFailedSQLiteProviderSource(&file)
 	source, found, err := e.providerSourceForDiscoveredFile(ctx, provider, file)
 	if err != nil {
 		return processResult{err: err}, true
@@ -14043,6 +14191,51 @@ func (e *Engine) stampProviderFileIdentity(
 		}
 		results[i].Session.File.Inode = inode
 		results[i].Session.File.Device = device
+	}
+}
+
+// discardStaleSQLiteProviderSource removes discovery-carried metadata when
+// the container pass no longer holds a live capture: the pass failed its
+// recapture, or the container changed after it. The recheck stats the live
+// container, so a write landing between the post-discovery recapture and
+// this worker cannot leave a stale full-digest source whose pre-change
+// child digest matches the archived fingerprint and skips the changed
+// session. The provider must resolve the current source before any
+// freshness gate can inspect its fingerprint.
+func (e *Engine) discardStaleSQLiteProviderSource(file *parser.DiscoveredFile) {
+	if file == nil || file.ProviderSource == nil {
+		return
+	}
+	dbPath, _, ok := sqliteContainerSourceForFile(*file)
+	if !ok {
+		return
+	}
+	e.containerMu.Lock()
+	passActive := e.containerPass != nil
+	e.containerMu.Unlock()
+	if passActive && !e.sqliteContainerPassCaptureStillCurrent(dbPath) {
+		file.ProviderSource = nil
+	}
+}
+
+// discardFailedSQLiteProviderSource drops carried metadata for a container
+// the pass has recorded as failed, under the container lock, without a
+// fresh stat. It backs the stat-based recheck above for consumers that run
+// after it: the failure may be recorded by any worker at any point in the
+// pass, and carried digests must not outlive it.
+func (e *Engine) discardFailedSQLiteProviderSource(file *parser.DiscoveredFile) {
+	if file == nil || file.ProviderSource == nil {
+		return
+	}
+	dbPath, _, ok := sqliteContainerSourceForFile(*file)
+	if !ok {
+		return
+	}
+	e.containerMu.Lock()
+	failed := e.containerPass != nil && e.containerPass.failed[dbPath]
+	e.containerMu.Unlock()
+	if failed {
+		file.ProviderSource = nil
 	}
 }
 

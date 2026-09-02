@@ -3,6 +3,8 @@ package parser
 import (
 	"context"
 	"crypto/sha256"
+	"database/sql"
+	"encoding/binary"
 	"encoding/json/v2"
 	"errors"
 	"fmt"
@@ -69,7 +71,7 @@ func (f openCodeFormatProviderFactory) NewProvider(cfg ProviderConfig) Provider 
 		Caps:   openCodeFormatProviderCapabilities(),
 		Config: cfg,
 		sources: newOpenCodeFormatSourceSet(
-			cfg.Roots, f.spec, cfg.SQLiteContainerUnchangedSinceTrust, f.index,
+			cfg.Roots, f.spec, cfg.SQLiteContainerListsWatermarkOnly, f.index,
 		),
 	}
 }
@@ -406,6 +408,11 @@ type openCodeFormatSource struct {
 	WatermarkOnly bool
 }
 
+const (
+	openCodeReconciliationSourceStateVersion = 1
+	openCodeReconciliationSourceStateHeader  = 8 + 1 + 2
+)
+
 type openCodeFormatSourceIndex struct {
 	projectMetadataSessions map[string]map[string]struct{}
 	projectMetadataIndexed  map[string]struct{}
@@ -429,13 +436,9 @@ func newOpenCodeFormatSourceIndex() *openCodeFormatSourceIndex {
 type openCodeFormatSourceSet struct {
 	roots []string
 	spec  openCodeProviderSpec
-	// containerTrusted, when non-nil, reports that a shared container is
-	// byte-identical to the last fully verified pass (see
-	// ProviderConfig.SQLiteContainerUnchangedSinceTrust). Discover answers
-	// with the bounded watermark-only listing for such containers: the
-	// engine's container gate skips every member before fingerprinting, so
-	// the full child digest would be archive-sized work nothing reads.
-	containerTrusted func(dbPath string) bool
+	// containerListsWatermarkOnly, when non-nil, authorizes a shared container
+	// to use the complete-membership watermark listing for the current pass.
+	containerListsWatermarkOnly func(dbPath string) bool
 	// projectMetadataSessions indexes only sessions whose cwd resolution uses
 	// project metadata, so project events do not rescan concrete sessions.
 	projectMetadataSessions map[string]map[string]struct{}
@@ -447,7 +450,7 @@ type openCodeFormatSourceSet struct {
 func newOpenCodeFormatSourceSet(
 	roots []string,
 	spec openCodeProviderSpec,
-	containerTrusted func(dbPath string) bool,
+	containerListsWatermarkOnly func(dbPath string) bool,
 	sharedIndex ...*openCodeFormatSourceIndex,
 ) openCodeFormatSourceSet {
 	index := (*openCodeFormatSourceIndex)(nil)
@@ -458,13 +461,13 @@ func newOpenCodeFormatSourceSet(
 		index = newOpenCodeFormatSourceIndex()
 	}
 	return openCodeFormatSourceSet{
-		roots:                   cleanJSONLRoots(roots),
-		spec:                    spec,
-		containerTrusted:        containerTrusted,
-		projectMetadataSessions: index.projectMetadataSessions,
-		projectMetadataIndexed:  index.projectMetadataIndexed,
-		projectMetadataErrors:   index.projectMetadataErrors,
-		projectMetadataMu:       index.projectMetadataMu,
+		roots:                       cleanJSONLRoots(roots),
+		spec:                        spec,
+		containerListsWatermarkOnly: containerListsWatermarkOnly,
+		projectMetadataSessions:     index.projectMetadataSessions,
+		projectMetadataIndexed:      index.projectMetadataIndexed,
+		projectMetadataErrors:       index.projectMetadataErrors,
+		projectMetadataMu:           index.projectMetadataMu,
 	}
 }
 
@@ -492,8 +495,11 @@ func (s openCodeFormatSourceSet) Discover(ctx context.Context) ([]SourceRef, err
 			storageIDs = s.spec.storageIDs(root)
 		}
 		for _, dbPath := range src.DBPaths {
-			trusted := s.containerTrusted != nil && s.containerTrusted(dbPath)
-			dbSources, err := s.sqliteSources(ctx, root, dbPath, storageIDs, trusted)
+			watermarkOnly := s.containerListsWatermarkOnly != nil &&
+				s.containerListsWatermarkOnly(dbPath)
+			dbSources, err := s.sqliteSources(
+				ctx, root, dbPath, storageIDs, watermarkOnly,
+			)
 			if err != nil {
 				if ctx.Err() != nil {
 					return nil, err
@@ -597,7 +603,8 @@ func (s openCodeFormatSourceSet) discoverRootEach(
 		var callbackErr error
 		var membershipErr error
 		stream := s.spec.streamSQLite
-		if s.containerTrusted != nil && s.containerTrusted(dbPath) &&
+		if s.containerListsWatermarkOnly != nil &&
+			s.containerListsWatermarkOnly(dbPath) &&
 			s.spec.streamSQLiteWatermark != nil {
 			stream = s.spec.streamSQLiteWatermark
 		}
@@ -938,12 +945,142 @@ func (s openCodeFormatSourceSet) SourceForReconciliation(
 		if !ok {
 			continue
 		}
+		sourcePath, sourcePathOK := s.pathFromSource(source)
+		if sourcePathOK {
+			if dbPath, sessionID, sqlite := s.spec.parseVirtual(sourcePath); sqlite &&
+				s.containerListsWatermarkOnly != nil &&
+				s.containerListsWatermarkOnly(dbPath) {
+				watermark, composite, found, err :=
+					openCodeSQLiteSessionWatermarkOnly(ctx, dbPath, sessionID)
+				if err != nil {
+					return SourceRef{}, false, err
+				}
+				if !found {
+					return SourceRef{}, false, nil
+				}
+				if composite {
+					if src, ok := source.Opaque.(openCodeFormatSource); ok {
+						src.MTimeNS = watermark * 1_000_000
+						src.CompositeMTime = true
+						src.WatermarkOnly = true
+						source.Opaque = src
+					}
+				}
+			}
+		}
 		if project != "" {
 			source.ProjectHint = project
 		}
 		return source, true, nil
 	}
 	return SourceRef{}, false, nil
+}
+
+func (s openCodeFormatSourceSet) SourceForReconciliationWithState(
+	ctx context.Context, path, project string, state ReconciliationSourceState,
+) (SourceRef, bool, error) {
+	if state.Version == 0 {
+		return s.SourceForReconciliation(ctx, path, project)
+	}
+	if err := ctx.Err(); err != nil {
+		return SourceRef{}, false, err
+	}
+	for _, root := range s.roots {
+		source, ok := s.sourceRefForReconciliationState(root, path)
+		if !ok {
+			continue
+		}
+		if project != "" {
+			source.ProjectHint = project
+		}
+		return source, true, nil
+	}
+	return SourceRef{}, false, nil
+}
+
+func (s openCodeFormatSourceSet) sourceRefForReconciliationState(
+	root, path string,
+) (SourceRef, bool) {
+	root = filepath.Clean(root)
+	path = filepath.Clean(path)
+	if dbPath, sessionID, ok := s.spec.parseVirtual(path); ok {
+		if _, under := relUnder(root, dbPath); !under {
+			return SourceRef{}, false
+		}
+		if selected := s.storageSessionPathForReconciliation(root, sessionID); selected != "" {
+			return s.sourceRefFromStoragePath(root, selected)
+		}
+		return s.newSourceRef(root, path, ""), true
+	}
+	if !s.isStorageSessionPath(root, path, true) {
+		return SourceRef{}, false
+	}
+	return s.newSourceRef(root, path, openCodeSessionProject(path)), true
+}
+
+func (s openCodeFormatSourceSet) storageSessionPathForReconciliation(
+	root, sessionID string,
+) string {
+	src := s.spec.resolve(root)
+	if src.Mode != OpenCodeSourceStorage {
+		return ""
+	}
+	entries, err := os.ReadDir(src.SessionRoot)
+	if err != nil {
+		return ""
+	}
+	for _, entry := range entries {
+		if !isDirOrSymlink(entry, src.SessionRoot) {
+			continue
+		}
+		path := filepath.Join(src.SessionRoot, entry.Name(), sessionID+".json")
+		// Same validation as discovery's isStorageSessionPath: a symlinked
+		// session file must not resolve, or reconciliation would ingest
+		// content outside the configured source root.
+		if IsRegularFile(path) {
+			return path
+		}
+	}
+	return ""
+}
+
+// openCodeSQLiteSessionWatermarkOnly carries the same session/project
+// watermark as a watermark discovery row without resolving child tables.
+// Streamed reconciliation rehydrates sources from their paths, so it needs
+// this bounded form to preserve the discovery decision before the freshness
+// gate decides whether a child digest is necessary.
+func openCodeSQLiteSessionWatermarkOnly(
+	ctx context.Context, dbPath, sessionID string,
+) (watermark int64, composite, found bool, err error) {
+	if err := ctx.Err(); err != nil {
+		return 0, false, false, err
+	}
+	db, err := openOpenCodeDB(dbPath)
+	if err != nil {
+		return 0, false, false, err
+	}
+	defer db.Close()
+	composite, err = openCodeCompositeMtimeSupportedCached(db, dbPath)
+	if err != nil {
+		return 0, false, false, err
+	}
+	query := "SELECT s.time_updated FROM session s WHERE s.id = ?"
+	if composite {
+		query = "SELECT " + openCodeSessionRowWatermarkExpr +
+			" FROM session s" + openCodeSessionCompositeMtimeJoins +
+			" WHERE s.id = ?"
+	}
+	err = db.QueryRowContext(ctx, query, sessionID).Scan(&watermark)
+	if errors.Is(err, sql.ErrNoRows) {
+		return 0, composite, false, nil
+	}
+	if err != nil {
+		return 0, composite, false, fmt.Errorf(
+			"loading opencode session watermark %s#%s: %w",
+			dbPath, sessionID, err,
+		)
+	}
+	return watermark, composite, true, nil
 }
 
 var errOpenCodeCanonicalSourceFound = errors.New("opencode canonical source found")
@@ -1253,6 +1390,20 @@ func (s openCodeFormatSourceSet) sqliteSources(
 	return sources, nil
 }
 
+// SourceUsesOpenCodeCompositeMTime reports whether a discovered SQLite source
+// carries the full composite watermark. The sync owner uses this fidelity bit
+// to stamp verification only after a digest-listed pass.
+func SourceUsesOpenCodeCompositeMTime(source SourceRef) bool {
+	switch src := source.Opaque.(type) {
+	case openCodeFormatSource:
+		return src.CompositeMTime && !src.WatermarkOnly
+	case *openCodeFormatSource:
+		return src != nil && src.CompositeMTime && !src.WatermarkOnly
+	default:
+		return false
+	}
+}
+
 // changedWatermarkSources answers a shared-container change event with only
 // the members whose carried session-row watermark is not already covered by
 // the caller's stored freshness. The watermark listing streams in ascending
@@ -1376,6 +1527,113 @@ func (s openCodeFormatSourceSet) sqliteSourceRefFromMeta(
 		ref.Opaque = src
 	}
 	return ref, true
+}
+
+func (p *openCodeFormatProvider) ReconciliationSourceState(
+	source SourceRef,
+) (ReconciliationSourceState, bool) {
+	return p.sources.reconciliationSourceState(source)
+}
+
+func (p *openCodeFormatProvider) SourceForReconciliationWithState(
+	ctx context.Context, path, project string, state ReconciliationSourceState,
+) (SourceRef, bool, error) {
+	return p.sources.SourceForReconciliationWithState(ctx, path, project, state)
+}
+
+func (p *openCodeFormatProvider) ApplyReconciliationSourceState(
+	source *SourceRef, state ReconciliationSourceState,
+) error {
+	return p.sources.applyReconciliationSourceState(source, state)
+}
+
+func (s openCodeFormatSourceSet) reconciliationSourceState(
+	source SourceRef,
+) (ReconciliationSourceState, bool) {
+	path, ok := s.pathFromSource(source)
+	if !ok {
+		return ReconciliationSourceState{}, false
+	}
+	if _, _, ok := s.spec.parseVirtual(path); !ok {
+		return ReconciliationSourceState{}, false
+	}
+	src, ok := openCodeSourceValue(source)
+	if !ok || len(src.ChildDigest) > 0xffff {
+		return ReconciliationSourceState{}, false
+	}
+	payload := make([]byte, openCodeReconciliationSourceStateHeader+len(src.ChildDigest))
+	binary.BigEndian.PutUint64(payload, uint64(src.MTimeNS))
+	var flags byte
+	if src.CompositeMTime {
+		flags |= 1 << 0
+	}
+	if src.WatermarkOnly {
+		flags |= 1 << 1
+	}
+	payload[8] = flags
+	binary.BigEndian.PutUint16(payload[9:], uint16(len(src.ChildDigest)))
+	copy(payload[openCodeReconciliationSourceStateHeader:], src.ChildDigest)
+	return ReconciliationSourceState{
+		Version: openCodeReconciliationSourceStateVersion,
+		Payload: payload,
+	}, true
+}
+
+func (s openCodeFormatSourceSet) applyReconciliationSourceState(
+	source *SourceRef, state ReconciliationSourceState,
+) error {
+	if source == nil || state.Version == 0 {
+		return nil
+	}
+	path, ok := s.pathFromSource(*source)
+	if !ok {
+		return fmt.Errorf("%s reconciliation source path unavailable", s.spec.agent)
+	}
+	if _, _, sqlite := s.spec.parseVirtual(path); !sqlite {
+		// Source resolution may have promoted the virtual member to its
+		// canonical storage shadow. SQLite-only state must not follow it.
+		return nil
+	}
+	if state.Version != openCodeReconciliationSourceStateVersion {
+		return fmt.Errorf("unsupported %s reconciliation source state version %d",
+			s.spec.agent, state.Version)
+	}
+	if len(state.Payload) < openCodeReconciliationSourceStateHeader {
+		return fmt.Errorf("invalid %s reconciliation source state", s.spec.agent)
+	}
+	digestLen := int(binary.BigEndian.Uint16(state.Payload[9:]))
+	if len(state.Payload) != openCodeReconciliationSourceStateHeader+digestLen {
+		return fmt.Errorf("invalid %s reconciliation source state length", s.spec.agent)
+	}
+	if state.Payload[8]&^(byte(1<<0)|byte(1<<1)) != 0 {
+		return fmt.Errorf("invalid %s reconciliation source state flags", s.spec.agent)
+	}
+	if state.Payload[8]&(1<<1) != 0 && state.Payload[8]&(1<<0) == 0 {
+		return fmt.Errorf("invalid %s reconciliation source state flags", s.spec.agent)
+	}
+	src, ok := openCodeSourceValue(*source)
+	if !ok {
+		return fmt.Errorf("%s reconciliation source state target unavailable", s.spec.agent)
+	}
+	src.MTimeNS = int64(binary.BigEndian.Uint64(state.Payload))
+	flags := state.Payload[8]
+	src.CompositeMTime = flags&(1<<0) != 0
+	src.WatermarkOnly = flags&(1<<1) != 0
+	src.ChildDigest = string(state.Payload[openCodeReconciliationSourceStateHeader:])
+	source.Opaque = src
+	return nil
+}
+
+func openCodeSourceValue(source SourceRef) (openCodeFormatSource, bool) {
+	switch src := source.Opaque.(type) {
+	case openCodeFormatSource:
+		return src, true
+	case *openCodeFormatSource:
+		if src != nil {
+			return *src, true
+		}
+	}
+	return openCodeFormatSource{}, false
 }
 
 func (s openCodeFormatSourceSet) sourcesForChangedPathInRoot(
