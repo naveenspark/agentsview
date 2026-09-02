@@ -221,6 +221,9 @@ func New(
 	// backend.
 	var sessions service.SessionService
 	if local, ok := database.(*db.DB); ok {
+		if cfg.UsageOnly {
+			local.EnableUsageOnlyStorage()
+		}
 		sessions = service.NewDirectBackend(local, engine)
 	} else {
 		sessions = service.NewReadOnlyBackend(database)

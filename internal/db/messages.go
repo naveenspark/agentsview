@@ -935,7 +935,9 @@ func (db *DB) InsertMessages(msgs []Message) error {
 	if err := db.requireWritable(); err != nil {
 		return err
 	}
-	if len(msgs) == 0 {
+	rawMessages := msgs
+	msgs = db.messagesForStorage(msgs)
+	if len(rawMessages) == 0 {
 		return nil
 	}
 	t := time.Now()
@@ -957,30 +959,46 @@ func (db *DB) InsertMessages(msgs []Message) error {
 	}
 	defer func() { _ = tx.Rollback() }()
 
-	ids, err := insertMessagesTx(tx, msgs)
-	if err != nil {
-		return err
-	}
+	if len(msgs) > 0 {
+		ids, err := insertMessagesTx(tx, msgs)
+		if err != nil {
+			return err
+		}
 
-	toolCalls := resolveToolCalls(msgs, ids)
-	if err := insertToolCallsTx(tx, toolCalls); err != nil {
-		return err
+		toolCalls := resolveToolCalls(msgs, ids)
+		if err := insertToolCallsTx(tx, toolCalls); err != nil {
+			return err
+		}
+		events := resolveToolResultEvents(msgs)
+		if err := insertToolResultEventsTx(tx, events); err != nil {
+			return err
+		}
 	}
-	events := resolveToolResultEvents(msgs)
-	if err := insertToolResultEventsTx(tx, events); err != nil {
-		return err
-	}
-	sessionIDs := messageSessionIDs(msgs)
-	for _, sessionID := range sessionIDs {
+	storedSessionIDs := messageSessionIDs(msgs)
+	for _, sessionID := range storedSessionIDs {
 		if err := bumpTranscriptRevisionTx(tx, sessionID); err != nil {
 			return err
 		}
-		if err := setSessionAutomationFromMessagesTx(
-			tx, sessionID,
-		); err != nil {
+	}
+	sessionIDs := messageSessionIDs(rawMessages)
+	for _, sessionID := range sessionIDs {
+		var err error
+		if db.UsageOnlyStorageEnabled() {
+			err = updateUsageOnlyAutomationTx(
+				tx, sessionID, messagesForSession(rawMessages, sessionID),
+			)
+		} else {
+			err = setSessionAutomationFromMessagesTx(tx, sessionID)
+		}
+		if err != nil {
 			return err
 		}
-		if err := invalidateSessionSignalsTx(tx, sessionID); err != nil {
+		if db.UsageOnlyStorageEnabled() {
+			err = settleUsageOnlySignalsTx(tx, sessionID)
+		} else {
+			err = invalidateSessionSignalsTx(tx, sessionID)
+		}
+		if err != nil {
 			return err
 		}
 	}
@@ -1033,6 +1051,11 @@ func writeMessagesTx(tx *sql.Tx, msgs []Message) error {
 func (db *DB) WriteSessionIncremental(
 	sessionID string, msgs []Message, update IncrementalSessionUpdate,
 ) error {
+	rawMessages := msgs
+	msgs = db.messagesForStorage(msgs)
+	if db.UsageOnlyStorageEnabled() {
+		update.SubagentLinks = usageOnlySubagentLinks(update.SubagentLinks)
+	}
 	t := time.Now()
 	defer func() {
 		if d := time.Since(t); d > slowOpThreshold {
@@ -1073,10 +1096,20 @@ func (db *DB) WriteSessionIncremental(
 	if err := updateSessionIncrementalTx(tx, sessionID, update); err != nil {
 		return err
 	}
-	if err := updateSessionAutomationFromMessagesTx(tx, sessionID); err != nil {
+	if db.UsageOnlyStorageEnabled() {
+		err = updateUsageOnlyAutomationTx(tx, sessionID, rawMessages)
+	} else {
+		err = updateSessionAutomationFromMessagesTx(tx, sessionID)
+	}
+	if err != nil {
 		return err
 	}
-	if err := invalidateSessionSignalsTx(tx, sessionID); err != nil {
+	if db.UsageOnlyStorageEnabled() {
+		err = settleUsageOnlySignalsTx(tx, sessionID)
+	} else {
+		err = invalidateSessionSignalsTx(tx, sessionID)
+	}
+	if err != nil {
 		return err
 	}
 	if err := tx.Commit(); err != nil {
@@ -1172,6 +1205,8 @@ func (db *DB) ReplaceSessionMessages(
 ) error {
 	msgs = append([]Message(nil), msgs...)
 	_ = ValidateAndSanitize(nil, msgs, nil)
+	rawMessages := msgs
+	msgs = db.messagesForStorage(msgs)
 
 	t := time.Now()
 	defer func() {
@@ -1243,19 +1278,29 @@ func (db *DB) ReplaceSessionMessages(
 	if err := resetIncrementalMarkerTx(tx, sessionID); err != nil {
 		return err
 	}
-	if err := updateSessionAutomationFromMessagesTx(tx, sessionID); err != nil {
+	if db.UsageOnlyStorageEnabled() {
+		err = updateUsageOnlyAutomationTx(tx, sessionID, rawMessages)
+	} else {
+		err = updateSessionAutomationFromMessagesTx(tx, sessionID)
+	}
+	if err != nil {
 		return err
 	}
-	// The new messages invalidate any findings scanned from the old content, so
-	// clear them and reset the scan state (empty version => secrets scan
-	// --backfill re-scans). ReplaceSessionContent does not call this method; it
-	// supplies fresh findings via replaceSecretFindingsTx directly.
-	if transcriptChanged {
-		if err := replaceSecretFindingsTx(tx, sessionID, nil, 0, ""); err != nil {
-			return err
+	if db.UsageOnlyStorageEnabled() {
+		err = settleUsageOnlySignalsTx(tx, sessionID)
+	} else {
+		// The new messages invalidate any findings scanned from the old content,
+		// so clear them and reset the scan state (empty version => secrets scan
+		// --backfill re-scans). ReplaceSessionContent does not call this method;
+		// it supplies fresh findings via replaceSecretFindingsTx directly.
+		if transcriptChanged {
+			if err := replaceSecretFindingsTx(tx, sessionID, nil, 0, ""); err != nil {
+				return err
+			}
 		}
+		err = invalidateSessionSignalsTx(tx, sessionID)
 	}
-	if err := invalidateSessionSignalsTx(tx, sessionID); err != nil {
+	if err != nil {
 		return err
 	}
 	if err := enqueueArtifactExportIfGenerationUnchangedTx(
@@ -1440,6 +1485,16 @@ func (db *DB) ReplaceSessionContent(
 	sessionID string, msgs []Message,
 	signals SessionSignalUpdate, findings []SecretFinding,
 ) error {
+	if len(msgs) > 0 {
+		msgs = append([]Message(nil), msgs...)
+		_ = ValidateAndSanitize(nil, msgs, nil)
+	}
+	rawMessages := msgs
+	msgs = db.messagesForStorage(msgs)
+	if db.UsageOnlyStorageEnabled() {
+		signals = usageOnlySignalUpdate()
+		findings = nil
+	}
 	db.mu.Lock()
 	defer db.mu.Unlock()
 
@@ -1497,7 +1552,12 @@ func (db *DB) ReplaceSessionContent(
 	if err := resetIncrementalMarkerTx(tx, sessionID); err != nil {
 		return err
 	}
-	if err := updateSessionAutomationFromMessagesTx(tx, sessionID); err != nil {
+	if db.UsageOnlyStorageEnabled() {
+		err = updateUsageOnlyAutomationTx(tx, sessionID, rawMessages)
+	} else {
+		err = updateSessionAutomationFromMessagesTx(tx, sessionID)
+	}
+	if err != nil {
 		return err
 	}
 	if err := updateSessionSignalsTx(tx, sessionID, signals); err != nil {

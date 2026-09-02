@@ -656,8 +656,9 @@ type DB struct {
 	// a later close reports success, or write ownership could be released
 	// (or the database file replaced) while a connection still holds the
 	// file. Guarded by connMu.
-	undrainedPools []*sql.DB
-	readOnly       bool
+	undrainedPools   []*sql.DB
+	readOnly         bool
+	usageOnlyStorage atomic.Bool
 	// writerClosed is set while the writer pool is intentionally closed for a
 	// worker maintenance pass (CloseWriter). It lets write attempts report
 	// ErrWriterClosed instead of the generic read-only error.
@@ -1012,19 +1013,26 @@ func configureReaderPool(reader *sql.DB) {
 // If the schema is current but the data version is stale, the database
 // is also preserved and marked for a re-sync on the next cycle.
 func Open(path string) (*DB, error) {
-	return open(context.Background(), path, true)
+	return open(context.Background(), path, true, false)
+}
+
+// OpenUsageOnly opens an archive whose durable storage contract excludes
+// transcript payloads. The policy is active before startup migrations run so
+// they cannot reinterpret classifications whose source text was discarded.
+func OpenUsageOnly(path string) (*DB, error) {
+	return open(context.Background(), path, true, true)
 }
 
 // OpenIsolated opens an archive without starting long-running database
 // maintenance. Short-lived, isolated workflows must close the returned DB.
 func OpenIsolated(path string) (*DB, error) {
-	return open(context.Background(), path, false)
+	return open(context.Background(), path, false, false)
 }
 
 // OpenIsolatedContext is OpenIsolated with cooperative cancellation between
 // database initialization phases. The returned database must be closed.
 func OpenIsolatedContext(ctx context.Context, path string) (*DB, error) {
-	return open(ctx, path, false)
+	return open(ctx, path, false, false)
 }
 
 // OpenFreshIsolatedContext initializes a current-schema archive in an empty,
@@ -1067,7 +1075,10 @@ func OpenFreshIsolatedContext(ctx context.Context, path string) (*DB, error) {
 	return d, nil
 }
 
-func open(ctx context.Context, path string, backgroundMaintenance bool) (*DB, error) {
+func open(
+	ctx context.Context, path string,
+	backgroundMaintenance, usageOnly bool,
+) (*DB, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
@@ -1090,6 +1101,9 @@ func open(ctx context.Context, path string, backgroundMaintenance bool) (*DB, er
 	d, err := openAndInit(ctx, path, schemaRepairNeeded, backgroundMaintenance)
 	if err != nil {
 		return nil, err
+	}
+	if usageOnly {
+		d.EnableUsageOnlyStorage()
 	}
 	closeOnError := func(err error) (*DB, error) {
 		if _, bounded := ctx.Deadline(); bounded {
@@ -3466,6 +3480,20 @@ func ensureUsageIndexColumnsLocked(
 // or stale remote machines after the hash was stamped.
 func (db *DB) backfillIsAutomatedLocked(w *writerHandle) error {
 	current := ClassifierHash()
+	if db.UsageOnlyStorageEnabled() {
+		// Usage-only archives deliberately discard the text this migration
+		// audits. Session writes classify while raw parser/importer data is
+		// still available, so the stored flag is the durable authority here.
+		_, err := w.Exec(
+			`INSERT INTO stats (key, value) VALUES (?, ?)
+			 ON CONFLICT(key) DO UPDATE SET value = excluded.value`,
+			ClassifierHashKey, current,
+		)
+		if err != nil {
+			return fmt.Errorf("storing classifier hash: %w", err)
+		}
+		return nil
+	}
 	var stored string
 	err := w.QueryRow(
 		`SELECT value FROM stats WHERE key = ?`,

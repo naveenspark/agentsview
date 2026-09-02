@@ -1384,6 +1384,15 @@ func TestResolveDataDir_DefaultAndEnvOverride(t *testing.T) {
 	assert.Equal(t, custom, dir)
 }
 
+func TestLoadMinimalEnablesUsageOnlyStorageFromEnvironment(t *testing.T) {
+	f := newConfigFixture(t)
+	t.Setenv("AGENTSVIEW_USAGE_ONLY", "true")
+
+	cfg := f.LoadMinimal(t)
+
+	assert.True(t, cfg.UsageOnly)
+}
+
 func TestResolveDataDir_ExpandsHome(t *testing.T) {
 	home := t.TempDir()
 	setTestHome(t, home)

@@ -665,6 +665,7 @@ type Config struct {
 	DisableUpdateCheck   bool                   `json:"disable_update_check" toml:"disable_update_check"`
 	NoSync               bool                   `json:"-" toml:"-"`
 	SkipInitialSync      bool                   `json:"-" toml:"-"`
+	UsageOnly            bool                   `json:"-" toml:"-"`
 	PG                   PGConfig               `json:"pg,omitempty" toml:"pg"`
 	DefaultPG            string                 `json:"default_pg,omitempty" toml:"default_pg"`
 	PGTargets            map[string]PGConfig    `json:"-" toml:"-"`
@@ -1821,6 +1822,9 @@ func (c *Config) loadEnv() {
 	}
 	if v := os.Getenv("AGENTSVIEW_DISABLE_UPDATE_CHECK"); v != "" {
 		c.DisableUpdateCheck = v == "1" || v == "true"
+	}
+	if v := os.Getenv("AGENTSVIEW_USAGE_ONLY"); v != "" {
+		c.UsageOnly = v == "1" || v == "true"
 	}
 }
 

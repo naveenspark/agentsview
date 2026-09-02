@@ -121,6 +121,7 @@ func (im Importer) PreparePending(
 	if err != nil {
 		return nil, err
 	}
+	config.UsageOnly = im.DB.UsageOnlyStorageEnabled()
 
 	physicalPaths := make([]string, 0, len(request.Journal.Entries))
 	for _, entry := range request.Journal.Entries {

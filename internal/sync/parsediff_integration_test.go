@@ -216,6 +216,34 @@ func TestParseDiffCleanArchiveIsIdentical(t *testing.T) {
 	assert.False(t, report.HasFailures(), "HasFailures")
 }
 
+func TestParseDiffUsageOnlyArchiveIsIdentical(t *testing.T) {
+	env := setupSingleAgentTestEnv(t, parser.AgentClaude)
+	env.writeClaudeSession(t, "test-proj", "pd-usage-only.jsonl",
+		parseDiffClaudeContentRich())
+
+	cfg := sync.EngineConfig{
+		AgentDirs: map[parser.AgentType][]string{
+			parser.AgentClaude: {env.claudeDir},
+		},
+		Machine:   "local",
+		UsageOnly: true,
+	}
+	stats := sync.NewEngine(env.db, cfg).SyncAll(t.Context(), nil)
+	require.Equal(t, 1, stats.TotalSessions)
+	require.Equal(t, 1, stats.Synced)
+	require.Zero(t, stats.Failed)
+
+	report, err := sync.NewDiffEngine(env.db, cfg).ParseDiff(
+		t.Context(),
+		sync.ParseDiffOptions{Agents: []parser.AgentType{parser.AgentClaude}},
+	)
+	require.NoError(t, err)
+	assert.Equal(t, sync.ParseDiffTotals{Examined: 1, Identical: 1},
+		report.Totals)
+	assert.Empty(t, report.FieldCounts)
+	assert.Empty(t, report.Sessions)
+}
+
 // TestParseDiffDetectsStoredDrift mutates stored rows directly after
 // a sync and verifies each drifted session is classified DiffChanged
 // with the expected field names while an untouched control session
@@ -2192,7 +2220,7 @@ func TestParseDiffEngineRefusesWrites(t *testing.T) {
 
 	path := env.writeClaudeSession(t, "test-proj", "pd-guard.jsonl",
 		parseDiffClaudeContent(
-			"guard prompt with AKIA7QHWN2DKR4FYPLJM",
+			"guard prompt with private configuration text",
 			"guard reply",
 		))
 

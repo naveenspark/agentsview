@@ -496,6 +496,7 @@ func (p *PreparedHTTP) RebuildContributor() (syncpkg.RebuildContributor, error) 
 	if err != nil {
 		return syncpkg.RebuildContributor{}, err
 	}
+	config.UsageOnly = p.sync.DB.UsageOnlyStorageEnabled()
 	persistSkipCache := func(engine *syncpkg.Engine, database *db.DB) error {
 		var err error
 		if p.mirrorImport != nil {

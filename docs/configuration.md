@@ -43,6 +43,28 @@ The Cursor source in code attribution stats is a live, machine-local read from
 else on the host answering the stats request. The attribution database is not
 synced into AgentsView's archive and is not pushed to PostgreSQL.
 
+### Usage-only archives
+
+Set `AGENTSVIEW_USAGE_ONLY=1` for an archive dedicated to token and cost
+reporting. AgentsView keeps session timing plus the message rows required for
+token accounting and assistant-activity counts. Retained rows omit message
+text, thinking text, tool calls, tool results, and content-derived session
+titles; unrelated message rows are discarded.
+
+Use a separate data directory for this profile:
+
+```bash
+AGENTSVIEW_DATA_DIR=~/.agentsview-usage \
+AGENTSVIEW_USAGE_ONLY=1 \
+agentsview sync
+```
+
+The profile supports usage reports such as `agentsview usage daily`. Session
+search, transcript viewing, tool analytics, and content-derived quality metrics
+require a standard archive. Enabling this profile does not rewrite content
+already present in an existing database, which is why a dedicated data
+directory is required.
+
 ## Config File
 
 The config file at `~/.agentsview/config.toml` is auto-created on first run. It

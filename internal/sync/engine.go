@@ -28,6 +28,7 @@ import (
 	"go.kenn.io/agentsview/internal/secrets"
 	"go.kenn.io/agentsview/internal/signals"
 	"go.kenn.io/agentsview/internal/timeutil"
+	"go.kenn.io/agentsview/internal/usagefacts"
 )
 
 const (
@@ -488,6 +489,10 @@ type EngineConfig struct {
 	// StableSourceSnapshots reports that configured source files are immutable
 	// for this engine. Bounded capture sets it after copying quiescent sources.
 	StableSourceSnapshots bool
+	// UsageOnly keeps token-accounting metadata while omitting transcript
+	// bodies, thinking text, tool payloads, and content-derived titles. It is
+	// intended for isolated reporting archives, not the session viewer.
+	UsageOnly bool
 	// Emitter, when non-nil, is called once after each sync pass
 	// that wrote data. Safe to leave nil (e.g., in PG serve mode
 	// where the engine is not run).
@@ -574,6 +579,7 @@ type Engine struct {
 	disableSignalRecompute  bool
 	disableProjectDiscovery bool
 	stableSourceSnapshots   bool
+	usageOnly               bool
 	idPrefix                string
 	pathRewriter            func(string) string
 	storedPathResolver      func(string) (string, bool)
@@ -843,6 +849,9 @@ func (e *Engine) ResetStagedProviderStatHashes() {
 func NewEngine(
 	database *db.DB, cfg EngineConfig,
 ) *Engine {
+	if cfg.UsageOnly {
+		database.EnableUsageOnlyStorage()
+	}
 	skipCache := make(map[string]int64)
 	if !cfg.Ephemeral {
 		if loaded, err := database.LoadSkippedFiles(); err == nil {
@@ -911,9 +920,10 @@ func NewEngine(
 		s3CodexIndexCache:       make(map[string]s3CodexIndexSnapshot),
 		ephemeral:               cfg.Ephemeral,
 		discardWritesOnCancel:   cfg.DiscardPendingWritesOnCancel,
-		disableSignalRecompute:  cfg.DisableSignalRecomputation,
+		disableSignalRecompute:  cfg.DisableSignalRecomputation || cfg.UsageOnly,
 		disableProjectDiscovery: cfg.DisableFilesystemProjectDiscovery,
 		stableSourceSnapshots:   cfg.StableSourceSnapshots,
+		usageOnly:               cfg.UsageOnly,
 		idPrefix:                cfg.IDPrefix,
 		pathRewriter:            cfg.PathRewriter,
 		storedPathResolver:      cfg.StoredPathResolver,
@@ -949,7 +959,7 @@ func NewEngine(
 			context.Background(), sessionID,
 		)
 	}
-	if cfg.DisableSignalRecomputation {
+	if e.disableSignalRecompute {
 		recompute = func(string) {}
 	}
 	e.signalSched = newSignalScheduler(
@@ -969,7 +979,7 @@ func NewEngine(
 			flush()
 		},
 	)
-	if cfg.DisableSignalRecomputation {
+	if e.disableSignalRecompute {
 		e.signalSched.stop()
 	}
 	return e
@@ -2958,7 +2968,11 @@ func (e *Engine) resyncBuildLocked(
 		"Opening temporary database",
 		"",
 	)
-	newDB, err := db.Open(tempPath)
+	openReplacement := db.Open
+	if e.usageOnly {
+		openReplacement = db.OpenUsageOnly
+	}
+	newDB, err := openReplacement(tempPath)
 	if err != nil {
 		log.Printf("resync: open temp db: %v", err)
 		restoreSkipCache()
@@ -14600,8 +14614,10 @@ func (e *Engine) tryIncrementalJSONL(
 	// Other agents can legitimately have an empty first_message
 	// alongside real user rows — for example Codex inserts orphan
 	// subagent notifications as Role=user messages that bypass
-	// firstMessage — so this fall-through is gated on Claude.
-	if agent == parser.AgentClaude && inc.FirstMessage == "" &&
+	// firstMessage — so this fall-through is gated on Claude. Usage-only
+	// archives deliberately discard every preview; their incremental
+	// automation classifier consumes the raw appended rows instead.
+	if !e.usageOnly && agent == parser.AgentClaude && inc.FirstMessage == "" &&
 		chunkHasRealUserPrompt(newMsgs) {
 		log.Printf(
 			"incremental %s %s: first real user prompt after "+
@@ -15408,6 +15424,9 @@ func (e *Engine) failProjectIdentityBackfill(
 func (e *Engine) recomputeSignalsFromDB(
 	ctx context.Context, sessionID string,
 ) (int, error) {
+	if e.usageOnly {
+		return 0, e.db.SettleUsageOnlySignals(sessionID)
+	}
 	if e.disableSignalRecompute {
 		return 0, nil
 	}
@@ -17167,12 +17186,14 @@ func (e *Engine) writeBatchBulkWithOutcomeContext(
 		if usageErr != nil {
 			return outcome
 		}
+		identityObservation, hasIdentityObservation :=
+			e.projectIdentityObservationForWrite(pw, s)
 		writes = append(writes, db.SessionBatchWrite{
 			Session:     s,
 			Messages:    msgs,
 			UsageEvents: usageEvents,
 			IdentityObservation: identityObservationOrZero(
-				e.projectIdentityObservationForWrite(pw, s),
+				identityObservation, hasIdentityObservation,
 			),
 			IdentitySnapshotProject: &snapshotProject,
 			Signals:                 update,
@@ -17810,7 +17831,6 @@ func (e *Engine) writeIncremental(
 	msgCount := inc.msgCount - filtered
 	userFiltered := countUserMsgs(inc.msgs) - newUser
 	userMsgCount := inc.userMsgCount - userFiltered
-
 	var endedAt *string
 	if !inc.endedAt.IsZero() {
 		s := inc.endedAt.Format(time.RFC3339Nano)
@@ -17832,19 +17852,21 @@ func (e *Engine) writeIncremental(
 
 	subagentLinks := make([]db.ToolCallSubagentLink, len(inc.links))
 	for i, link := range inc.links {
-		toolCall := db.ToolCall{
-			ResultContent:       parser.DecodeContent(link.ResultContentRaw),
-			ResultContentLength: link.ResultContentLen,
-		}
-		e.anomalies.recordSanitize(db.SanitizeToolCall(&toolCall))
 		subagentLinks[i] = db.ToolCallSubagentLink{
 			ToolUseID: link.ToolUseID,
 			SubagentSessionID: applyIDPrefixToID(
 				e.idPrefix, link.SubagentSessionID,
 			),
-			ResultContent:    toolCall.ResultContent,
-			ResultContentLen: toolCall.ResultContentLength,
-			HasResult:        link.HasResult,
+			HasResult: link.HasResult,
+		}
+		if !e.usageOnly {
+			toolCall := db.ToolCall{
+				ResultContent:       parser.DecodeContent(link.ResultContentRaw),
+				ResultContentLength: link.ResultContentLen,
+			}
+			e.anomalies.recordSanitize(db.SanitizeToolCall(&toolCall))
+			subagentLinks[i].ResultContent = toolCall.ResultContent
+			subagentLinks[i].ResultContentLen = toolCall.ResultContentLength
 		}
 	}
 
@@ -18165,9 +18187,23 @@ func (e *Engine) shouldPreserveOpenCodeFormatArchive(
 		)
 		return true
 	}
-	if openCodeLegacyArchiveLooksIncomplete(
-		currentMsgs, storedMsgs,
-	) {
+	incomplete := false
+	if e.usageOnly {
+		_, comparableCurrentMsgs := e.db.ProjectSessionForStorage(
+			db.Session{}, currentMsgs,
+		)
+		_, comparableStoredMsgs := e.db.ProjectSessionForStorage(
+			db.Session{}, storedMsgs,
+		)
+		incomplete = openCodeUsageOnlyArchiveLooksIncomplete(
+			comparableCurrentMsgs, comparableStoredMsgs,
+		)
+	} else {
+		incomplete = openCodeLegacyArchiveLooksIncomplete(
+			currentMsgs, storedMsgs,
+		)
+	}
+	if incomplete {
 		if hasOpenCodeFormatStorageFingerprint(agent, storedHash) {
 			log.Printf(
 				"skip %s session %s: storage fingerprint changed but update looks incomplete relative to archive",
@@ -18314,6 +18350,48 @@ func openCodeLegacyArchiveLooksIncomplete(
 	return false
 }
 
+func openCodeUsageOnlyArchiveLooksIncomplete(
+	parsed, stored []db.Message,
+) bool {
+	if parsed == nil {
+		return len(stored) > 0
+	}
+	if len(parsed) < len(stored) {
+		return true
+	}
+	parsedByIdentity := make(
+		map[openCodeMessageIdentity]db.Message, len(parsed),
+	)
+	for _, message := range parsed {
+		parsedByIdentity[openCodeMessageStorageIdentity(message)] = message
+	}
+	for _, storedMessage := range stored {
+		parsedMessage, ok := parsedByIdentity[openCodeMessageStorageIdentity(storedMessage)]
+		if !ok || openCodeUsageOnlyMessageLooksIncomplete(
+			parsedMessage, storedMessage,
+		) {
+			return true
+		}
+	}
+	return false
+}
+
+type openCodeMessageIdentity struct {
+	sourceUUID string
+	ordinal    int
+	role       string
+}
+
+func openCodeMessageStorageIdentity(message db.Message) openCodeMessageIdentity {
+	if message.SourceUUID != "" {
+		return openCodeMessageIdentity{sourceUUID: message.SourceUUID}
+	}
+	return openCodeMessageIdentity{
+		ordinal: message.Ordinal,
+		role:    message.Role,
+	}
+}
+
 func openCodeMessageLooksIncomplete(
 	parsed, stored db.Message,
 ) bool {
@@ -18344,6 +18422,37 @@ func openCodeMessageLooksIncomplete(
 	}
 	return countToolResultEvents(parsed.ToolCalls) <
 		countToolResultEvents(stored.ToolCalls)
+}
+
+func openCodeUsageOnlyMessageLooksIncomplete(
+	parsed, stored db.Message,
+) bool {
+	if parsed.Role != stored.Role {
+		return false
+	}
+	if openCodeUsageLooksIncomplete(parsed, stored) {
+		return true
+	}
+	return len(parsed.ToolCalls) < len(stored.ToolCalls)
+}
+
+func openCodeUsageLooksIncomplete(parsed, stored db.Message) bool {
+	if len(stored.TokenUsage) == 0 {
+		return false
+	}
+	if len(parsed.TokenUsage) == 0 ||
+		(stored.Model != "" && parsed.Model == "") {
+		return true
+	}
+	parsedUsage := usagefacts.ParseTokenUsage(string(parsed.TokenUsage))
+	storedUsage := usagefacts.ParseTokenUsage(string(stored.TokenUsage))
+	return parsedUsage.InputTokens < storedUsage.InputTokens ||
+		parsedUsage.OutputTokens < storedUsage.OutputTokens ||
+		parsedUsage.ReasoningTokens < storedUsage.ReasoningTokens ||
+		parsedUsage.CacheCreationTokens < storedUsage.CacheCreationTokens ||
+		parsedUsage.CacheCreation1hTokens < storedUsage.CacheCreation1hTokens ||
+		parsedUsage.CacheReadTokens < storedUsage.CacheReadTokens ||
+		parsedUsage.WebSearchRequests < storedUsage.WebSearchRequests
 }
 
 func sanitizedMessageContentLength(msg db.Message) int {

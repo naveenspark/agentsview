@@ -29,6 +29,7 @@ func (im Importer) ImportExtracted(
 	if err != nil {
 		return stats, err
 	}
+	config.UsageOnly = im.DB.UsageOnlyStorageEnabled()
 
 	engine := syncpkg.NewEngine(im.DB, config)
 	defer engine.Close()
