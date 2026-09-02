@@ -49,6 +49,10 @@ description: Release history for AgentsView
 - Make container builds less dependent on any one Debian mirror by distributing
   downloads and failing over automatically.
 - Build from source with Go 1.27 and use its JSON v2 behavior consistently.
+- Retire inactive usage-cache generations after every lease-aware process has
+  released them. Retirement revalidates cache ownership and generation identity
+  under an exclusive cross-process lease; active, legacy, and mismatched files
+  remain untouched.
 
 **Bug fixes**
 
