@@ -13,6 +13,22 @@ parser change that needs a full resync must build a fresh database, sync source
 files, copy orphaned sessions from the old database, and swap the files
 atomically. Preserve sessions even when their source files no longer exist.
 
+## Archive Content Policy
+
+`archive_content` (`internal/config.ArchiveContent`) narrows what the SQLite
+archive stores. The `*db.DB` handle is the single authority: `Open` variants and
+`sync.NewEngine` only tighten it, never loosen it, and every write path projects
+sessions and messages through `internal/db/archive_content.go` before rows are
+written.
+
+- Route any new session, message, tool call, signal, or finding write through
+  the existing projection helpers instead of checking the policy inline.
+- Resync copies archived rows with `ATTACH`, which bypasses the write path.
+  `applyArchiveContentToCopiedSessionsTx` mirrors the Go projection in SQL for
+  the orphan and trash copies. Keep the two in step when either changes.
+- Compute derived values (signals, secret findings) from the projected messages
+  so a later recompute from stored rows reproduces them.
+
 ## Backend Parity
 
 - Keep observable behavior and query shape aligned between SQLite and

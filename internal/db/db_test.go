@@ -1051,9 +1051,9 @@ func TestCurrentDataVersionPositAssistantProviderIdentity(t *testing.T) {
 		"Posit Assistant provider identity requires re-parsing usage rows")
 }
 
-func TestCurrentDataVersionAntigravityCLICwdAndWorktreeProject(t *testing.T) {
-	assert.Equal(t, 96, CurrentDataVersion(),
-		"Antigravity CLI cwd and worktree project recovery require a sequential backfill")
+func TestCurrentDataVersionOpenCodeMessageIdentity(t *testing.T) {
+	assert.Equal(t, 97, CurrentDataVersion(),
+		"OpenCode rows need re-parsing to record their storage message ID")
 }
 
 func TestInsertMessages_PreservesToolResultEvents(t *testing.T) {
